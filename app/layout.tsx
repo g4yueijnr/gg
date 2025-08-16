@@ -2,10 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import ReactQueryProvider from "@/components/ReactQueryProvider";
-import AuthProvider from "@/components/AuthProvider";
-import { getSession } from "@/lib/auth";
-import { Toaster } from "sonner";
-import ProgressBar from "@/lib/ProgressBar";
+import SessionWrapper from "@/components/SessionWrapper";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -27,8 +24,6 @@ export default async function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  const session = await getSession();
-
   return (
     <html lang="en">
       <head>
@@ -38,11 +33,9 @@ export default async function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
         <ReactQueryProvider>
-          <AuthProvider session={session}>
-            <Toaster richColors position="top-center" />
-            <ProgressBar />
+          <SessionWrapper>
             {children}
-          </AuthProvider>
+          </SessionWrapper>
         </ReactQueryProvider>
       </body>
     </html>
