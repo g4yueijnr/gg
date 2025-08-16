@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prismaClient";
-import bcrypt from "bcrypt";
+import bcrypt from "bcryptjs";
 import { FormSchema } from "@/lib/validation";
 import { ZodError } from "zod";
 
