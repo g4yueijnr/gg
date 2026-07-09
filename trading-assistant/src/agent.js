@@ -16,8 +16,11 @@ How to behave:
 - If something important is ambiguous (which market/outcome they mean, order size, or the price cap), ask one short clarifying question instead of guessing.
 - Always resolve a market via search_markets first and confirm you have the right outcome token before trading. If several markets plausibly match, show the top candidates and ask.
 - "Outbid up to X" instructions are standing rules -> use create_auto_outbid_rule, not a one-off order.
-- After placing orders or creating rules, state exactly what is now resting: market, outcome, price, size, and cap.
+- "One cent above the current highest bid" style instructions: omit startPrice on create_auto_outbid_rule - the engine reads the live book and starts one tick above the best bid at placement time. Don't read the book yourself and hardcode a price for this; the omitted-startPrice path is more accurate.
+- Cancel conditions ("cancel it Friday night", "pull it after 24 hours"): compute an ISO UTC datetime from the current time in <context> and pass it as expiresAt. Confirm the exact time back to the user in their terms.
+- After placing orders or creating rules, state exactly what is now resting: market, outcome, price, size, cap, and expiry if any.
 - Report failures honestly and suggest the fix (e.g. insufficient balance, price would cross the spread).
+- Order books: results may include a "note" field explaining data quality (e.g. depth unavailable, market suspended). Relay it. If a book comes back empty but the user says they can see orders in the app, NEVER insist the book is empty - tell them the API returned no data for that market and show the market title/state you found, so they can confirm it's the right one.
 - Prices: users often speak in cents ("10c", "ten cents") - convert to dollars per share (0.10). Shares are also called contracts.
 - Never invent market data - always read it from tools.`;
 
@@ -26,10 +29,10 @@ function toolDefs() {
   return [
     {
       name: "search_markets",
-      description: "Search Polymarket for active markets matching a text query. Returns markets with their outcomes and each outcome's tokenId (needed for all trading calls). Call this before trading when you don't already have the tokenId.",
+      description: "Search Polymarket for active markets matching a text query, a pasted polymarket.us link, or an exact market slug. Returns markets with their outcomes, each outcome's tokenId (needed for all trading calls), and live best bid/ask where available. Call this before trading when you don't already have the tokenId.",
       input_schema: {
         type: "object",
-        properties: { query: { type: "string", description: "Free-text search, e.g. 'Fed rate cut March'" } },
+        properties: { query: { type: "string", description: "Free-text search (e.g. 'Fed rate cut March'), a polymarket.us URL, or a market slug" } },
         required: ["query"],
       },
     },
@@ -82,29 +85,31 @@ function toolDefs() {
     },
     {
       name: "create_auto_outbid_rule",
-      description: "Create a standing auto-outbid rule: places a BUY order at startPrice and, whenever someone outbids it, instantly re-bids one tick above them - never exceeding maxPrice. Runs 24/7 in the app's background engine. Use for instructions like 'bid 10c and outbid anyone up to 20c'.",
+      description: "Create a standing auto-outbid rule: places a BUY order and, whenever someone outbids it, instantly re-bids one tick above them - never exceeding maxPrice. Runs 24/7 in the app's background engine. Use for instructions like 'bid 10c and outbid anyone up to 20c' or '200 contracts one cent above the current best bid, up to 60c' (for the latter, OMIT startPrice - the engine starts one tick above the live best bid automatically).",
       input_schema: {
         type: "object",
         properties: {
           tokenId: { type: "string" },
           size: { type: "number", description: "Shares/contracts to buy" },
-          startPrice: { type: "number", description: "Initial bid in dollars per share (0.10 = 10c)" },
-          maxPrice: { type: "number", description: "Hard cap in dollars per share (0.20 = 20c)" },
+          startPrice: { type: "number", description: "Initial bid in dollars per share (0.10 = 10c). OMIT to start one tick above the current best bid." },
+          maxPrice: { type: "number", description: "Hard cap in dollars per share (0.60 = 60c)" },
+          expiresAt: { type: "string", description: "Optional ISO 8601 UTC datetime when the rule should auto-cancel itself and pull the order, e.g. 2026-07-12T21:00:00Z. Compute it from the current time in <context> when the user says things like 'cancel it Friday' or 'kill it after 24 hours'." },
           marketQuestion: { type: "string", description: "The market question, for display" },
           outcome: { type: "string", description: "Outcome name, e.g. Yes/No" },
         },
-        required: ["tokenId", "size", "startPrice", "maxPrice", "marketQuestion", "outcome"],
+        required: ["tokenId", "size", "maxPrice", "marketQuestion", "outcome"],
       },
     },
     {
       name: "update_rule",
-      description: "Change a standing rule's maxPrice and/or size. Reactivates a rule that hit its cap if the new cap is higher.",
+      description: "Change a standing rule's maxPrice, size, and/or expiry. Reactivates a rule that hit its cap if the new cap is higher. Set expiresAt to null to remove an expiry.",
       input_schema: {
         type: "object",
         properties: {
           ruleId: { type: "string" },
           maxPrice: { type: "number" },
           size: { type: "number" },
+          expiresAt: { type: ["string", "null"], description: "New ISO 8601 auto-cancel time, or null to remove" },
         },
         required: ["ruleId"],
       },

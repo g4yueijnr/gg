@@ -48,19 +48,41 @@ export class RulesEngine {
 
   /**
    * Create an auto-outbid rule and place its initial order.
+   * startPrice may be omitted -> start one tick above the current best bid.
+   * expiresAt (ISO datetime) may be set -> rule auto-cancels at that time.
    */
-  async createAutoOutbid({ tokenId, size, startPrice, maxPrice, marketQuestion, outcome, conditionId }) {
+  async createAutoOutbid({ tokenId, size, startPrice, maxPrice, marketQuestion, outcome, conditionId, expiresAt }) {
     if (!(maxPrice > 0 && maxPrice < 1)) throw new Error("maxPrice must be between 0 and 1 (dollars per share).");
-    if (!(startPrice > 0 && startPrice <= maxPrice)) throw new Error("startPrice must be > 0 and <= maxPrice.");
+    if (startPrice !== undefined && startPrice !== null && !(startPrice > 0 && startPrice <= maxPrice)) {
+      throw new Error("startPrice must be > 0 and <= maxPrice.");
+    }
+    let expiryTs = null;
+    if (expiresAt) {
+      expiryTs = Date.parse(expiresAt);
+      if (Number.isNaN(expiryTs)) throw new Error(`Couldn't parse expiresAt "${expiresAt}" - use ISO format like 2026-07-12T21:00:00Z.`);
+      if (expiryTs <= Date.now()) throw new Error(`expiresAt (${expiresAt}) is in the past.`);
+    }
     this.pm.checkLimits({ price: maxPrice, size });
 
     const tickSize = await this.pm.getTickSize(tokenId);
     const book = await this.pm.getOrderBook(tokenId);
 
-    // If the market already bids above our start price, start by outbidding it (within cap).
-    let target = startPrice;
-    if (book.bestBid !== null && book.bestBid >= startPrice) {
+    let target;
+    if (startPrice === undefined || startPrice === null) {
+      // Relative start: one tick above whoever currently leads the book.
+      if (book.bestBid === null) {
+        throw new Error(
+          "There are no bids in this book right now, so 'one tick above the best bid' is undefined. " +
+          "Give an explicit starting price instead.",
+        );
+      }
       target = Math.min(round(book.bestBid + tickSize), maxPrice);
+    } else {
+      target = startPrice;
+      // If the market already bids at/above our start price, start by outbidding it (within cap).
+      if (book.bestBid !== null && book.bestBid >= startPrice) {
+        target = Math.min(round(book.bestBid + tickSize), maxPrice);
+      }
     }
     if (book.bestAsk !== null && target >= book.bestAsk) {
       throw new Error(
@@ -78,8 +100,9 @@ export class RulesEngine {
       outcome: outcome || "",
       side: "BUY",
       size,
-      startPrice,
+      startPrice: target,
       maxPrice,
+      expiresAt: expiryTs ? new Date(expiryTs).toISOString() : null,
       tickSize,
       status: "active",
       orderId: null,
@@ -97,7 +120,9 @@ export class RulesEngine {
     this.store.save();
 
     this.pm.watchToken(tokenId);
-    this._log(rule, `Rule created: bidding ${fmt(target)} for ${size} shares of "${rule.outcome}" - will auto-outbid up to ${fmt(maxPrice)}.`);
+    this._log(rule,
+      `Rule created: bidding ${fmt(target)} for ${size} shares of "${rule.outcome}" - will auto-outbid up to ${fmt(maxPrice)}` +
+      `${rule.expiresAt ? `, auto-cancels ${new Date(rule.expiresAt).toUTCString()}` : ""}.`);
     return rule;
   }
 
@@ -118,9 +143,19 @@ export class RulesEngine {
     return rule;
   }
 
-  async updateRule(ruleId, { maxPrice, size }) {
+  async updateRule(ruleId, { maxPrice, size, expiresAt }) {
     const rule = this.getRule(ruleId);
     if (!rule) throw new Error(`No rule with id ${ruleId}`);
+    if (expiresAt !== undefined) {
+      if (expiresAt === null || expiresAt === "") {
+        rule.expiresAt = null;
+      } else {
+        const ts = Date.parse(expiresAt);
+        if (Number.isNaN(ts)) throw new Error(`Couldn't parse expiresAt "${expiresAt}".`);
+        if (ts <= Date.now()) throw new Error(`expiresAt (${expiresAt}) is in the past.`);
+        rule.expiresAt = new Date(ts).toISOString();
+      }
+    }
     if (maxPrice !== undefined) {
       if (!(maxPrice > 0 && maxPrice < 1)) throw new Error("maxPrice must be between 0 and 1.");
       rule.maxPrice = maxPrice;
@@ -160,8 +195,25 @@ export class RulesEngine {
     this._locks.set(ruleId, next);
   }
 
+  /** Auto-cancel a rule whose expiry time has passed. Returns true if it expired. */
+  async _expireIfDue(rule) {
+    if (!rule.expiresAt || rule.status !== "active") return false;
+    if (Date.now() < Date.parse(rule.expiresAt)) return false;
+    if (rule.orderId) {
+      try { await this.pm.cancelOrder(rule.orderId); } catch (err) {
+        console.warn(`[rules] ${rule.id} expiry cancel failed: ${err.message}`);
+      }
+    }
+    rule.status = "expired";
+    rule.updatedAt = new Date().toISOString();
+    this.store.save();
+    this._log(rule, `Rule expired (${new Date(rule.expiresAt).toUTCString()}) - resting order cancelled as instructed.`, "warn");
+    return true;
+  }
+
   async _evaluate(rule, bestBid, bestAsk = null) {
     if (rule.status !== "active" || rule.myPrice === null) return;
+    if (await this._expireIfDue(rule)) return;
     if (bestBid <= rule.myPrice) return; // we're still on top (or tied at our own level)
 
     // Someone outbid us.
@@ -274,6 +326,10 @@ export class RulesEngine {
    * Periodic safety net: detect fills/cancellations that the websocket missed.
    */
   async _reconcile() {
+    // Expiries fire from here too, so rules lapse on time even in a quiet market.
+    for (const rule of this.activeRules()) {
+      await this._expireIfDue(rule);
+    }
     const active = this.activeRules().filter((r) => r.orderId);
     if (active.length === 0 || this.pm.readonly) return;
     let open;

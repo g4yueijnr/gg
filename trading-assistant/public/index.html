@@ -50,7 +50,7 @@
   .badge.active { background: rgba(63,185,109,.15); color: var(--green); }
   .badge.filled { background: rgba(79,143,247,.15); color: var(--accent); }
   .badge.capped, .badge.error { background: rgba(217,164,65,.15); color: var(--amber); }
-  .badge.cancelled { background: rgba(139,152,169,.15); color: var(--dim); }
+  .badge.cancelled, .badge.expired { background: rgba(139,152,169,.15); color: var(--dim); }
   .card button.mini { background: none; border: 1px solid var(--border); color: var(--dim); border-radius: 6px; font-size: 11px; padding: 2px 8px; cursor: pointer; float: right; }
   .card button.mini:hover { color: var(--red); border-color: var(--red); }
   .act { padding: 6px 2px; border-bottom: 1px solid var(--border); color: var(--dim); }
@@ -228,7 +228,8 @@ function render() {
         `${(r.status === "active" || r.status === "capped") ? '<button class="mini" data-rule="' + esc(r.id) + '">stop</button>' : ""}` +
         `<div class="title">${esc(r.outcome || "")} · ${esc(r.marketQuestion || "")}<span class="badge ${esc(r.status)}">${esc(r.status)}</span></div>` +
         `<div class="sub">my bid ${fmtC(r.myPrice)} · cap ${fmtC(r.maxPrice)} · ${r.size} shares` +
-        `${r.filledSize ? ` · filled ${r.filledSize}` : ""} · ${esc(r.id)}</div>`;
+        `${r.filledSize ? ` · filled ${r.filledSize}` : ""}` +
+        `${r.expiresAt ? ` · auto-cancels ${new Date(r.expiresAt).toLocaleString()}` : ""} · ${esc(r.id)}</div>`;
       panel.appendChild(div);
     }
     panel.querySelectorAll("button[data-rule]").forEach((b) => b.onclick = async () => {

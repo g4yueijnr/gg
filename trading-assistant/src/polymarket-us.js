@@ -60,6 +60,10 @@ export class PolymarketUSClient {
   // ---------- market discovery ----------
 
   async searchMarkets(query, limit = 8) {
+    // Pasted a polymarket.us link or an exact slug? Resolve it directly.
+    const direct = await this._resolveDirect(query);
+    if (direct) return [direct];
+
     const res = await this.api.search.query({ query, status: "active", limit });
     const out = [];
     for (const event of res.events || []) {
@@ -79,7 +83,58 @@ export class PolymarketUSClient {
         })),
       });
     }
-    return out.slice(0, limit);
+    const results = out.slice(0, limit);
+    await this._attachQuotes(results);
+    return results;
+  }
+
+  /** Add live best bid/ask to search results so the assistant sees real prices immediately. */
+  async _attachQuotes(results) {
+    const outcomes = results.flatMap((r) => r.outcomes).slice(0, 12);
+    await Promise.all(outcomes.map(async (o) => {
+      try {
+        const bbo = await this.api.markets.bbo(o.tokenId);
+        o.bestBid = this._toDollars(bbo?.bestBid);
+        o.bestAsk = this._toDollars(bbo?.bestAsk);
+        o.lastPrice = this._toDollars(bbo?.lastTradePx);
+      } catch { /* quote unavailable; leave blank */ }
+    }));
+  }
+
+  /** Resolve a pasted polymarket.us URL or bare slug straight to its market(s). */
+  async _resolveDirect(query) {
+    const m = String(query).trim().match(/(?:polymarket\.us\/(?:event|market)s?\/)?([a-z0-9]+(?:-[a-z0-9]+)+)\/?(?:[?#].*)?$/i);
+    if (!m) return null;
+    const slug = m[1].toLowerCase();
+    try {
+      const r = await this.api.markets.retrieveBySlug(slug);
+      if (r?.market && !r.market.closed) {
+        const result = {
+          question: r.market.title,
+          eventTitle: r.market.title,
+          slug: r.market.eventSlug || r.market.slug,
+          outcomes: [{ outcome: r.market.outcome || r.market.title, marketTitle: r.market.title, tokenId: r.market.slug }],
+        };
+        await this._attachQuotes([result]);
+        return result;
+      }
+    } catch { /* not a market slug */ }
+    try {
+      const r = await this.api.events.retrieveBySlug(slug);
+      const markets = (r?.event?.markets || []).filter((mk) => mk.active && !mk.closed);
+      if (markets.length) {
+        const result = {
+          question: r.event.title,
+          eventTitle: r.event.title,
+          slug: r.event.slug,
+          endDate: r.event.endTime,
+          outcomes: markets.map((mk) => ({ outcome: mk.outcome || mk.title, marketTitle: mk.title, tokenId: mk.slug })),
+        };
+        await this._attachQuotes([result]);
+        return result;
+      }
+    } catch { /* not an event slug either */ }
+    return null;
   }
 
   async getMarketByToken(slug) {
@@ -98,8 +153,64 @@ export class PolymarketUSClient {
   // ---------- order book / prices ----------
 
   async getOrderBook(slug) {
-    const book = await this.api.markets.book(slug);
-    return this._summarizeBook(slug, book.bids || [], book.offers || [], book.stats?.lastTradePx);
+    // Primary: full depth from the book endpoint.
+    let book = null;
+    let bookErr = null;
+    try {
+      book = await this.api.markets.book(slug);
+    } catch (err) {
+      bookErr = err;
+    }
+    if (book && ((book.bids && book.bids.length) || (book.offers && book.offers.length))) {
+      const s = this._summarizeBook(slug, book.bids || [], book.offers || [], book.stats?.lastTradePx);
+      s.state = book.state;
+      return s;
+    }
+
+    // Fallback: best bid/offer endpoint (some deployments serve quotes here even
+    // when the depth endpoint comes back empty).
+    try {
+      const bbo = await this.api.markets.bbo(slug);
+      const bestBid = this._toDollars(bbo?.bestBid);
+      const bestAsk = this._toDollars(bbo?.bestAsk);
+      if (bestBid !== null || bestAsk !== null) {
+        const summary = {
+          tokenId: slug,
+          bestBid, bestAsk,
+          bids: bestBid !== null ? [{ price: bestBid, size: bbo.bidDepth ?? null }] : [],
+          asks: bestAsk !== null ? [{ price: bestAsk, size: bbo.askDepth ?? null }] : [],
+          tickSize: 0.01,
+          lastTradePrice: this._toDollars(bbo?.lastTradePx),
+          note: "Full depth unavailable from the book endpoint - showing live best bid/ask.",
+        };
+        this.books.set(slug, { bestBid, bestAsk, ts: Date.now() });
+        return summary;
+      }
+    } catch { /* fall through to diagnosis */ }
+
+    // Still nothing: figure out WHY so the assistant can say something useful
+    // instead of pretending the market is empty.
+    console.warn(`[polymarket-us] empty book for "${slug}"; raw book=${JSON.stringify(book || null).slice(0, 300)}${bookErr ? ` err=${bookErr.message}` : ""}`);
+    let title = null;
+    let state = book?.state;
+    try {
+      const r = await this.api.markets.retrieveBySlug(slug);
+      title = r?.market?.title;
+      if (r?.market?.closed) state = state || "CLOSED";
+    } catch (err) {
+      if (err?.status === 404) {
+        throw new Error(`No market exists with slug "${slug}". The identifier may be wrong - use search_markets (or paste the market link) to get the exact tokenId.`);
+      }
+    }
+    return {
+      tokenId: slug,
+      bestBid: null, bestAsk: null, bids: [], asks: [],
+      tickSize: 0.01,
+      state,
+      note: title
+        ? `Market "${title}" exists but both quote endpoints returned no orders (state: ${state || "unknown"}). If the app clearly shows orders, this is a data issue - tell the user exactly that rather than claiming the book is empty.`
+        : "No order data returned.",
+    };
   }
 
   _summarizeBook(slug, rawBids, rawAsks, lastTradePx) {
@@ -307,7 +418,12 @@ export class PolymarketUSClient {
   _subscribe() {
     if (!this.ws || !this.ws.isConnected) return;
     try {
-      this.ws.subscribeMarketData(`md-${Date.now()}`, [...this.wsWanted]);
+      // Replace the previous subscription instead of stacking duplicates.
+      if (this._mdReqId) {
+        try { this.ws.unsubscribe(this._mdReqId); } catch { /* already gone */ }
+      }
+      this._mdReqId = `md-${Date.now()}`;
+      this.ws.subscribeMarketData(this._mdReqId, [...this.wsWanted]);
     } catch (err) {
       console.warn("[polymarket-us] subscribe failed:", err.message);
     }
