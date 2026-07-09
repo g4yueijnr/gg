@@ -2,7 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PM Assistant">
+<link rel="manifest" href="/manifest.json">
 <title>Polymarket Assistant</title>
 <style>
   :root {
@@ -57,7 +62,13 @@
   #login { position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; z-index: 10; }
   #login form { background: var(--panel); border: 1px solid var(--border); padding: 26px; border-radius: 12px; display: flex; gap: 8px; }
   #login input { background: var(--panel2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 12px; font: inherit; }
-  @media (max-width: 900px) { #side { display: none; } }
+  #menubtn { display: none; background: none; border: 1px solid var(--border); color: var(--text); border-radius: 7px; padding: 3px 11px; font: inherit; font-size: 13px; cursor: pointer; }
+  @media (max-width: 900px) {
+    #menubtn { display: inline-block; }
+    #side { display: none; position: fixed; top: 47px; left: 0; right: 0; bottom: 0; max-width: none; z-index: 5; border-top: 1px solid var(--border); }
+    #side.open { display: flex; }
+    header .status #wallet { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -71,6 +82,7 @@
   <div class="status">
     <span><span class="dot" id="tradedot"></span><span id="tradetext">checking…</span></span>
     <span id="wallet"></span>
+    <button id="menubtn">☰ Activity</button>
   </div>
 </header>
 
@@ -88,7 +100,7 @@ The outbidding runs in a background engine watching the live order feed, so it r
     </div>
     <div id="inputbar">
       <div id="inputwrap">
-        <textarea id="input" rows="1" placeholder="e.g. bid 10c for 200 shares of YES on the March Fed cut market, outbid anyone up to 20c"></textarea>
+        <textarea id="input" rows="1" placeholder="e.g. bid 10¢ on YES, outbid anyone up to 20¢"></textarea>
         <button class="primary" id="send">Send</button>
       </div>
     </div>
@@ -280,6 +292,12 @@ document.querySelectorAll("#tabs button").forEach((b) => b.onclick = () => {
   document.querySelectorAll("#tabs button").forEach((x) => x.classList.toggle("active", x === b));
   render();
 });
+$("#menubtn").onclick = () => {
+  const side = $("#side");
+  const open = side.classList.toggle("open");
+  $("#menubtn").textContent = open ? "✕ Close" : "☰ Activity";
+  if (open) render();
+};
 sendBtn.onclick = send;
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }

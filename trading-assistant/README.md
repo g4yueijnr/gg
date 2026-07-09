@@ -58,11 +58,28 @@ In dry-run mode it goes through all the motions without sending real orders.
 
 **4. Go live:** set `DRY_RUN=false` and restart.
 
-## Running it for days at a time
+## Running it 24/7 + using it from your phone
 
-The app is a single always-on process. Options, easiest first:
+The app can't run *on* a phone (phones sleep). Instead it runs on an always-on cloud server, and your phone opens it like a website — the bot keeps bidding even when your phone is off. Full walkthrough with Railway (~$5/month, no coding):
 
-**Railway / Render (recommended if you're not technical).** Push this folder to a GitHub repo, create a new project on [railway.app](https://railway.app) or [render.com](https://render.com) from that repo (both auto-detect the Dockerfile), and add your `.env` values as environment variables in their dashboard. You'll get a private URL you can open from your phone. Make sure `APP_PASSWORD` is set!
+1. **Get the code on GitHub** (it may already be there if this repo is yours). Railway deploys straight from a GitHub repo.
+2. **Sign up at [railway.app](https://railway.app)** using your GitHub account.
+3. Click **New Project → Deploy from GitHub repo** and pick this repository.
+4. In the service's **Settings**:
+   - **Root Directory** → `trading-assistant` (important — the app lives in this subfolder). Railway will auto-detect the Dockerfile.
+   - Pick the branch that contains the app.
+5. In the **Variables** tab, add your settings (same names as `.env`):
+   `OPENAI_API_KEY`, `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER_ADDRESS`, `POLYMARKET_SIGNATURE_TYPE`, `APP_PASSWORD` — and set `DRY_RUN` to `true` for your first test.
+6. **Add a volume** (right-click the service → Attach Volume) with mount path `/app/data`. This is where your rules and history are saved, so they survive restarts and updates.
+7. In **Settings → Networking**, click **Generate Domain**. That URL is your app.
+8. **On your phone:** open the URL in Safari/Chrome, enter your `APP_PASSWORD`, then use *Share → Add to Home Screen*. Now it looks and feels like an app.
+9. Try it out in dry-run mode, then set `DRY_RUN` to `false` in Variables and redeploy. You're live.
+
+[render.com](https://render.com) works the same way (use a paid instance — the free tier spins down when idle, which would pause your rules — and add a persistent disk at `/app/data`).
+
+⚠️ Since this is on the internet, `APP_PASSWORD` is a must. Your Polymarket private key lives only in the hosting provider's encrypted environment variables.
+
+Other options:
 
 **Docker anywhere:**
 
