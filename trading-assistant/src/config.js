@@ -8,9 +8,11 @@ function bool(v, def = false) {
 export const config = {
   port: Number(process.env.PORT || 3000),
 
-  // --- OpenAI (the chatbot brain) ---
-  openaiApiKey: process.env.OPENAI_API_KEY || "",
-  model: process.env.OPENAI_MODEL || "gpt-5.1",
+  // --- Anthropic / Claude (the chatbot brain) ---
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
+  // Haiku is Anthropic's fastest, most cost-efficient model - ideal here since
+  // the heavy lifting (outbidding) happens in the rules engine, not the AI.
+  model: process.env.CLAUDE_MODEL || "claude-haiku-4-5",
 
   // --- Polymarket US (the regulated US app) ---
   // Get both from https://polymarket.us/developer after verifying your account in the iOS app.

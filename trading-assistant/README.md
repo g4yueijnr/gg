@@ -4,7 +4,7 @@ Your personal Polymarket trading chatbot. Tell it what to do in plain English an
 
 > "Buy 200 shares of YES at 10¢ on the Fed rate cut market. If anyone outbids me, outbid them instantly — but never pay more than 20¢."
 
-The chat is powered by OpenAI (GPT-5.1 by default). The outbidding is **not** — it runs in a background engine wired directly into Polymarket's real-time order feed, so it reacts in milliseconds and keeps working for hours or days, even while you sleep.
+The chat is powered by Claude (Haiku 4.5 by default — fast and very cheap to run). The outbidding is **not** — it runs in a background engine wired directly into Polymarket's real-time order feed, so it reacts in milliseconds and keeps working for hours or days, even while you sleep.
 
 ## What it can do
 
@@ -32,7 +32,7 @@ npm install
 cp .env.example .env
 ```
 
-Open `.env` in any text editor and fill in `OPENAI_API_KEY` ([platform.openai.com/api-keys](https://platform.openai.com/api-keys) — powers the chat), `APP_PASSWORD` (make one up — required if you host online), and **one** of the two Polymarket setups:
+Open `.env` in any text editor and fill in `ANTHROPIC_API_KEY` ([platform.claude.com](https://platform.claude.com) → API keys — powers the chat), `APP_PASSWORD` (make one up — required if you host online), and **one** of the two Polymarket setups:
 
 **If you use the Polymarket US app (regulated US version):**
 
@@ -78,7 +78,7 @@ The app can't run *on* a phone (phones sleep). Instead it runs on an always-on c
    - **Root Directory** → `trading-assistant` (important — the app lives in this subfolder). Railway will auto-detect the Dockerfile.
    - Pick the branch that contains the app.
 5. In the **Variables** tab, add your settings (same names as `.env`):
-   `OPENAI_API_KEY`, `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER_ADDRESS`, `POLYMARKET_SIGNATURE_TYPE`, `APP_PASSWORD` — and set `DRY_RUN` to `true` for your first test.
+   `ANTHROPIC_API_KEY`, `APP_PASSWORD`, your Polymarket credentials (US: `POLYMARKET_US_KEY_ID` + `POLYMARKET_US_SECRET_KEY`; global: `POLYMARKET_PRIVATE_KEY` + `POLYMARKET_FUNDER_ADDRESS` + `POLYMARKET_SIGNATURE_TYPE`) — and set `DRY_RUN` to `true` for your first test.
 6. **Add a volume** (right-click the service → Attach Volume) with mount path `/app/data`. This is where your rules and history are saved, so they survive restarts and updates.
 7. In **Settings → Networking**, click **Generate Domain**. That URL is your app.
 8. **On your phone:** open the URL in Safari/Chrome, enter your `APP_PASSWORD`, then use *Share → Add to Home Screen*. Now it looks and feels like an app.
@@ -133,7 +133,7 @@ Honest limitations:
 trading-assistant/
 ├── src/
 │   ├── index.js       # web server + wiring
-│   ├── agent.js       # OpenAI chatbot + its trading tools
+│   ├── agent.js       # Claude chatbot + its trading tools
 │   ├── rules.js       # always-on rules engine (auto-outbid)
 │   ├── polymarket.js  # Polymarket REST + WebSocket client
 │   ├── store.js       # saves rules/history to data/state.json
