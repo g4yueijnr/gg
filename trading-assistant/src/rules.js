@@ -215,10 +215,18 @@ export class RulesEngine {
       this.store.save();
       return;
     }
+    // Cancel-then-replace: the new bid is only placed once the old order is
+    // confirmed gone, so we can never end up with two resting bids.
     if (rule.orderId) {
-      try { await this.pm.cancelOrder(rule.orderId); } catch (err) {
-        // If cancel fails because it filled, reconcile will pick it up.
-        console.warn(`[rules] ${rule.id} cancel failed: ${err.message}`);
+      const gone = await this._ensureCancelled(rule);
+      if (!gone) {
+        const lastWarn = this._cancelWarnTs?.get(rule.id) || 0;
+        if (Date.now() - lastWarn > 30000) {
+          (this._cancelWarnTs ||= new Map()).set(rule.id, Date.now());
+          this._log(rule,
+            `Couldn't confirm my old ${fmt(rule.myPrice)} order was cancelled - holding off on the re-bid to avoid doubling up. Will retry.`, "warn");
+        }
+        return; // retry on the next book update
       }
     }
     const resp = await this.pm.placeOrder({ tokenId: rule.tokenId, side: "BUY", price: freshTarget, size: remaining });
@@ -229,6 +237,37 @@ export class RulesEngine {
     rule.updatedAt = new Date().toISOString();
     this.store.save();
     this._log(rule, `Outbid detected at ${fmt(freshBid)} - moved my bid ${fmt(oldPrice)} -> ${fmt(freshTarget)} (cap ${fmt(rule.maxPrice)}).`);
+  }
+
+  /**
+   * Cancel a rule's current order and confirm it is actually gone (cancelled
+   * or fully filled). Returns false when we can't be sure - in that case the
+   * caller must NOT place a replacement bid.
+   */
+  async _ensureCancelled(rule) {
+    let cancelErr = null;
+    try {
+      const resp = await this.pm.cancelOrder(rule.orderId);
+      const notCanceled = resp?.not_canceled ?? resp?.notCanceled;
+      const failed = notCanceled && Object.prototype.hasOwnProperty.call(notCanceled, rule.orderId);
+      if (!failed) return true;
+      cancelErr = new Error(`exchange refused: ${JSON.stringify(notCanceled[rule.orderId])}`);
+    } catch (err) {
+      cancelErr = err;
+    }
+    // Cancel didn't clearly succeed - check the order's actual state.
+    try {
+      const detail = await this.pm.getOrder(rule.orderId);
+      if (!detail) return true; // no record -> gone
+      const status = String(detail.status || "").toUpperCase();
+      const matched = Number(detail.size_matched || 0);
+      if (status !== "LIVE" && status !== "OPEN") return true;   // cancelled/matched
+      if (matched >= rule.size - 1e-9) return true;              // fully filled (reconcile logs it)
+    } catch {
+      // Can't verify either - assume it may still be resting.
+    }
+    console.warn(`[rules] ${rule.id} cancel unconfirmed: ${cancelErr?.message}`);
+    return false;
   }
 
   /**
@@ -255,7 +294,12 @@ export class RulesEngine {
         continue;
       }
       // Order no longer open: either fully filled or cancelled externally.
-      const detail = await this.pm.getOrder(rule.orderId);
+      let detail;
+      try {
+        detail = await this.pm.getOrder(rule.orderId);
+      } catch {
+        continue; // transient error - re-check next cycle
+      }
       const matched = detail ? Number(detail.size_matched || 0) : null;
       if (matched !== null && matched >= rule.size - 1e-9) {
         rule.status = "filled";

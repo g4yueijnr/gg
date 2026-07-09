@@ -215,11 +215,9 @@ export class Polymarket {
 
   async getOrder(orderId) {
     this._assertTradable();
-    try {
-      return await this.client.getOrder(orderId);
-    } catch {
-      return null;
-    }
+    // Throws on transient/network errors; callers decide how to handle that.
+    // A missing order comes back as null/undefined.
+    return await this.client.getOrder(orderId);
   }
 
   async getBalance() {
