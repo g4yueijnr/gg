@@ -4,7 +4,7 @@ Your personal Polymarket trading chatbot. Tell it what to do in plain English an
 
 > "Buy 200 shares of YES at 10¢ on the Fed rate cut market. If anyone outbids me, outbid them instantly — but never pay more than 20¢."
 
-The chat is powered by Claude. The outbidding is **not** — it runs in a background engine wired directly into Polymarket's real-time order feed, so it reacts in milliseconds and keeps working for hours or days, even while you sleep.
+The chat is powered by OpenAI (GPT-5.1 by default). The outbidding is **not** — it runs in a background engine wired directly into Polymarket's real-time order feed, so it reacts in milliseconds and keeps working for hours or days, even while you sleep.
 
 ## What it can do
 
@@ -36,7 +36,7 @@ Open `.env` in any text editor and fill in:
 
 | Setting | Where to get it |
 |---|---|
-| `ANTHROPIC_API_KEY` | [platform.claude.com](https://platform.claude.com) → API keys. Powers the chat. |
+| `OPENAI_API_KEY` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys). Powers the chat. |
 | `POLYMARKET_PRIVATE_KEY` | Polymarket site → your profile picture → **Settings** → **Export Private Key** |
 | `POLYMARKET_FUNDER_ADDRESS` | The `0x...` wallet address shown on your Polymarket profile |
 | `POLYMARKET_SIGNATURE_TYPE` | `1` if you signed up with email (most people), `2` if you signed up with MetaMask |
@@ -107,7 +107,7 @@ Honest limitations:
 trading-assistant/
 ├── src/
 │   ├── index.js       # web server + wiring
-│   ├── agent.js       # Claude chatbot + its trading tools
+│   ├── agent.js       # OpenAI chatbot + its trading tools
 │   ├── rules.js       # always-on rules engine (auto-outbid)
 │   ├── polymarket.js  # Polymarket REST + WebSocket client
 │   ├── store.js       # saves rules/history to data/state.json

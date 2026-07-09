@@ -1,7 +1,7 @@
-import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 import { config } from "./config.js";
 
-const SYSTEM_PROMPT = `You are the user's personal Polymarket trading assistant. You run inside their private trading app, which is connected to their own Polymarket account. There is exactly one user and it is their account, their money, and their explicit standing instruction that you execute trades for them.
+const SYSTEM_PROMPT = `You are the user's personal Polymarket trading assistant and trading buddy. You run inside their private trading app, which is connected to their own Polymarket account. There is exactly one user and it is their account, their money, and their explicit standing instruction that you execute trades for them.
 
 What you can do with your tools:
 - Search Polymarket markets and read live order books.
@@ -10,7 +10,8 @@ What you can do with your tools:
 - Create "standing rules" that the app's always-on engine enforces in real time, 24/7, even while you are not in the loop. The main one is auto_outbid: keep a buy order resting, and if anyone outbids it, instantly re-bid one tick higher up to a hard price cap.
 
 How to behave:
-- Be a sharp, concise trading assistant. Lead with what you did or found; keep commentary brief.
+- Be a sharp, friendly trading buddy. Casual conversation is welcome - chat about markets, odds, strategy, whatever. But when it's time to act, be precise.
+- Lead with what you did or found; keep commentary brief.
 - When the user asks for an action that is fully specified (market, side, price, size), do it - don't ask for re-confirmation.
 - If something important is ambiguous (which market/outcome they mean, order size, or the price cap), ask one short clarifying question instead of guessing.
 - Always resolve a market via search_markets first and confirm you have the right outcome token before trading. If several markets plausibly match, show the top candidates and ask.
@@ -20,13 +21,13 @@ How to behave:
 - Prices: users often speak in cents ("10c", "ten cents") - convert to dollars per share (0.10). Shares are also called contracts.
 - Never invent market data - always read it from tools.`;
 
-/** Tool definitions (raw JSON schema). */
+/** Tool definitions in OpenAI function-calling format. */
 function toolDefs() {
-  return [
+  const defs = [
     {
       name: "search_markets",
       description: "Search Polymarket for active markets matching a text query. Returns markets with their outcomes and each outcome's tokenId (needed for all trading calls). Call this before trading when you don't already have the tokenId.",
-      input_schema: {
+      parameters: {
         type: "object",
         properties: { query: { type: "string", description: "Free-text search, e.g. 'Fed rate cut March'" } },
         required: ["query"],
@@ -35,7 +36,7 @@ function toolDefs() {
     {
       name: "get_order_book",
       description: "Get the live order book (best bid/ask and depth) plus tick size for an outcome token.",
-      input_schema: {
+      parameters: {
         type: "object",
         properties: { tokenId: { type: "string" } },
         required: ["tokenId"],
@@ -44,7 +45,7 @@ function toolDefs() {
     {
       name: "place_order",
       description: "Place a limit order (GTC). price is dollars per share, e.g. 0.10 for 10 cents. size is number of shares/contracts.",
-      input_schema: {
+      parameters: {
         type: "object",
         properties: {
           tokenId: { type: "string" },
@@ -58,7 +59,7 @@ function toolDefs() {
     {
       name: "cancel_order",
       description: "Cancel an open order by its orderId.",
-      input_schema: {
+      parameters: {
         type: "object",
         properties: { orderId: { type: "string" } },
         required: ["orderId"],
@@ -67,22 +68,22 @@ function toolDefs() {
     {
       name: "list_open_orders",
       description: "List the user's open orders on Polymarket.",
-      input_schema: { type: "object", properties: {} },
+      parameters: { type: "object", properties: {} },
     },
     {
       name: "get_positions",
       description: "List the user's current positions with value and PnL.",
-      input_schema: { type: "object", properties: {} },
+      parameters: { type: "object", properties: {} },
     },
     {
       name: "get_balance",
       description: "Get the user's available USDC balance on Polymarket.",
-      input_schema: { type: "object", properties: {} },
+      parameters: { type: "object", properties: {} },
     },
     {
       name: "create_auto_outbid_rule",
       description: "Create a standing auto-outbid rule: places a BUY order at startPrice and, whenever someone outbids it, instantly re-bids one tick above them - never exceeding maxPrice. Runs 24/7 in the app's background engine. Use for instructions like 'bid 10c and outbid anyone up to 20c'.",
-      input_schema: {
+      parameters: {
         type: "object",
         properties: {
           tokenId: { type: "string" },
@@ -98,7 +99,7 @@ function toolDefs() {
     {
       name: "update_rule",
       description: "Change a standing rule's maxPrice and/or size. Reactivates a rule that hit its cap if the new cap is higher.",
-      input_schema: {
+      parameters: {
         type: "object",
         properties: {
           ruleId: { type: "string" },
@@ -111,7 +112,7 @@ function toolDefs() {
     {
       name: "cancel_rule",
       description: "Cancel a standing rule and remove its resting order.",
-      input_schema: {
+      parameters: {
         type: "object",
         properties: { ruleId: { type: "string" } },
         required: ["ruleId"],
@@ -120,17 +121,18 @@ function toolDefs() {
     {
       name: "list_rules",
       description: "List all standing rules (active and past) with their status.",
-      input_schema: { type: "object", properties: {} },
+      parameters: { type: "object", properties: {} },
     },
     {
       name: "get_activity",
       description: "Read the recent activity log - everything the background engine did (outbids, fills, cap warnings).",
-      input_schema: {
+      parameters: {
         type: "object",
         properties: { limit: { type: "number", description: "Max entries, default 20" } },
       },
     },
   ];
+  return defs.map((d) => ({ type: "function", function: d }));
 }
 
 export class Agent {
@@ -138,8 +140,23 @@ export class Agent {
     this.pm = polymarket;
     this.rules = rules;
     this.store = store;
-    this.client = new Anthropic({ apiKey: config.anthropicApiKey });
+    // Don't crash at boot when the key is missing - fail politely in chat instead.
+    this.client = config.openaiApiKey ? new OpenAI({ apiKey: config.openaiApiKey }) : null;
     this.busy = false;
+    this._migrateHistory();
+  }
+
+  /** Older versions stored chat history in Anthropic's message format; reset if found. */
+  _migrateHistory() {
+    const msgs = this.store.state.messages;
+    const looksForeign = msgs.some(
+      (m) => Array.isArray(m.content) || !["user", "assistant", "tool", "system"].includes(m.role),
+    );
+    if (looksForeign) {
+      console.log("[agent] resetting chat history from previous provider format");
+      this.store.state.messages = [];
+      this.store.save();
+    }
   }
 
   async _runTool(name, input) {
@@ -170,68 +187,88 @@ export class Agent {
    * Returns the final assistant text.
    */
   async chat(userText, emit = () => {}) {
+    if (!this.client) throw new Error("OPENAI_API_KEY is not configured - add it to your .env and restart.");
     if (this.busy) throw new Error("Assistant is still working on the previous message.");
     this.busy = true;
     try {
       const messages = this.store.state.messages;
-      // Give the model ambient context without breaking the cached system prompt.
+      // Ambient context rides along with the user turn.
       const contextNote =
         `<context>now=${new Date().toISOString()} trading=${this.pm.readonly ? "DISABLED (no key configured)" : "enabled"}` +
         `${config.dryRun ? " DRY_RUN(orders simulated)" : ""} activeRules=${this.rules.activeRules().length}</context>`;
-      messages.push({ role: "user", content: [{ type: "text", text: `${contextNote}\n${userText}` }] });
+      messages.push({ role: "user", content: `${contextNote}\n${userText}` });
 
       const tools = toolDefs();
       let finalText = "";
 
       for (let iter = 0; iter < 12; iter++) {
-        const stream = this.client.messages.stream({
+        const stream = await this.client.chat.completions.create({
           model: config.model,
-          max_tokens: 16000,
-          thinking: { type: "adaptive" },
-          system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+          stream: true,
+          messages: [{ role: "system", content: SYSTEM_PROMPT }, ...messages],
           tools,
-          messages,
         });
 
-        stream.on("text", (delta) => {
-          finalText += delta;
-          emit({ type: "text", delta });
-        });
+        let text = "";
+        const toolCalls = []; // accumulate streamed tool_call deltas by index
 
-        const message = await stream.finalMessage();
-        messages.push({ role: "assistant", content: message.content });
-        this._trimHistory();
+        for await (const chunk of stream) {
+          const choice = chunk.choices?.[0];
+          if (!choice) continue;
+          const delta = choice.delta || {};
+          if (delta.content) {
+            text += delta.content;
+            finalText += delta.content;
+            emit({ type: "text", delta: delta.content });
+          }
+          for (const tc of delta.tool_calls || []) {
+            const slot = (toolCalls[tc.index] ||= { id: "", name: "", arguments: "" });
+            if (tc.id) slot.id = tc.id;
+            if (tc.function?.name) slot.name += tc.function.name;
+            if (tc.function?.arguments) slot.arguments += tc.function.arguments;
+          }
+        }
+
+        const assistantMsg = { role: "assistant", content: text || null };
+        if (toolCalls.length) {
+          assistantMsg.tool_calls = toolCalls.map((tc) => ({
+            id: tc.id,
+            type: "function",
+            function: { name: tc.name, arguments: tc.arguments },
+          }));
+        }
+        messages.push(assistantMsg);
         this.store.save();
 
-        if (message.stop_reason === "pause_turn") continue;
-        if (message.stop_reason !== "tool_use") break;
+        if (!toolCalls.length) break; // no tool requests -> the reply is final
 
-        const toolUses = message.content.filter((b) => b.type === "tool_use");
-        const results = [];
-        for (const tu of toolUses) {
-          emit({ type: "tool_start", name: tu.name, input: tu.input });
+        for (const tc of toolCalls) {
+          let input = {};
+          try { input = tc.arguments ? JSON.parse(tc.arguments) : {}; } catch { /* leave empty */ }
+          emit({ type: "tool_start", name: tc.name, input });
           let result;
           let isError = false;
           try {
-            result = await this._runTool(tu.name, tu.input);
+            result = await this._runTool(tc.name, input);
           } catch (err) {
             result = `Error: ${err.message}`;
             isError = true;
           }
-          emit({ type: "tool_end", name: tu.name, ok: !isError });
-          results.push({
-            type: "tool_result",
-            tool_use_id: tu.id,
+          emit({ type: "tool_end", name: tc.name, ok: !isError });
+          messages.push({
+            role: "tool",
+            tool_call_id: tc.id,
             content: typeof result === "string" ? result : JSON.stringify(result ?? null),
-            ...(isError ? { is_error: true } : {}),
           });
         }
-        messages.push({ role: "user", content: results });
         this.store.save();
-        emit({ type: "text", delta: finalText ? "\n\n" : "" });
-        if (finalText) finalText += "\n\n";
+        if (finalText && !finalText.endsWith("\n\n")) {
+          emit({ type: "text", delta: "\n\n" });
+          finalText += "\n\n";
+        }
       }
 
+      this._trimHistory();
       this.store.save();
       return finalText;
     } finally {
@@ -240,22 +277,15 @@ export class Agent {
   }
 
   /**
-   * Keep chat history bounded. Trim only at boundaries that start with a plain
-   * user text message so tool_use/tool_result pairs are never separated.
+   * Keep chat history bounded. Trim only at plain user-message boundaries so
+   * assistant tool_calls are never separated from their tool results.
    */
   _trimHistory() {
     const messages = this.store.state.messages;
-    const MAX = 60;
+    const MAX = 80;
     if (messages.length <= MAX) return;
     let cut = messages.length - MAX;
-    while (cut < messages.length) {
-      const m = messages[cut];
-      const isPlainUser = m.role === "user" &&
-        Array.isArray(m.content) &&
-        m.content.every((b) => b.type === "text");
-      if (isPlainUser) break;
-      cut++;
-    }
+    while (cut < messages.length && messages[cut].role !== "user") cut++;
     if (cut > 0 && cut < messages.length) {
       this.store.state.messages = messages.slice(cut);
     }

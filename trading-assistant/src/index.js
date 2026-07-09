@@ -10,8 +10,8 @@ import { Agent } from "./agent.js";
 const here = path.dirname(fileURLToPath(import.meta.url));
 
 async function main() {
-  if (!config.anthropicApiKey) {
-    console.warn("[app] ANTHROPIC_API_KEY is not set - the chat will not work until you add it to .env");
+  if (!config.openaiApiKey) {
+    console.warn("[app] OPENAI_API_KEY is not set - the chat will not work until you add it to .env");
   }
 
   const store = new Store(config.dataDir);

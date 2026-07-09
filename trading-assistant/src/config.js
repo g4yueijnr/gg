@@ -8,9 +8,9 @@ function bool(v, def = false) {
 export const config = {
   port: Number(process.env.PORT || 3000),
 
-  // --- Anthropic (the chatbot brain) ---
-  anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
-  model: process.env.CLAUDE_MODEL || "claude-opus-4-8",
+  // --- OpenAI (the chatbot brain) ---
+  openaiApiKey: process.env.OPENAI_API_KEY || "",
+  model: process.env.OPENAI_MODEL || "gpt-5.1",
 
   // --- Polymarket credentials ---
   // Your wallet private key (exported from Polymarket: profile -> settings -> export private key)
