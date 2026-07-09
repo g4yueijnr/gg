@@ -99,6 +99,22 @@ export class PolymarketUSClient {
       });
     }
     const results = out.slice(0, limit);
+    // Search truncates each event's market list - fetch full events so every
+    // prop (e.g. "before round 4") is present, not just the popular ones.
+    await Promise.all(results.slice(0, 3).map(async (r) => {
+      if (!r.slug) return;
+      try {
+        const full = await this.api.events.retrieveBySlug(r.slug);
+        const markets = (full?.event?.markets || []).filter((mk) => mk.active !== false && mk.closed !== true && mk.slug);
+        if (markets.length > r.outcomes.length) {
+          r.outcomes = markets.slice(0, 25).map((mk) => ({
+            outcome: mk.outcome || mk.title,
+            marketTitle: mk.title,
+            tokenId: mk.slug,
+          }));
+        }
+      } catch { /* keep the search-provided subset */ }
+    }));
     await this._attachQuotes(results);
     return results;
   }
@@ -530,6 +546,39 @@ export class PolymarketUSClient {
       await step("auth check: orders.list()", () => this.api.orders.list());
     } else {
       out.steps.push({ name: "auth check", ok: false, error: "skipped - no API keys configured" });
+    }
+
+    // Websocket probe: the live feed is a separate data source from the REST
+    // book/bbo endpoints - it can carry quotes even when those come back empty.
+    if (!this.readonly && out.candidateSlugs.length) {
+      const probe = await new Promise((resolve) => {
+        let ws = null;
+        const seen = new Set();
+        const finish = (result) => {
+          clearTimeout(timer);
+          try { ws?.close(); } catch { /* noop */ }
+          resolve(result);
+        };
+        const timer = setTimeout(() => {
+          resolve({ ok: seen.size > 0, receivedFor: [...seen], note: seen.size ? "live data flowing" : "no live data within 6s (may be normal for quiet markets)" });
+          try { ws?.close(); } catch { /* noop */ }
+        }, 6000);
+        try {
+          ws = this.api.ws.markets();
+          ws.on("marketData", (m) => {
+            const s = m.marketData?.marketSlug;
+            if (s) seen.add(s);
+            if (seen.size >= out.candidateSlugs.length) finish({ ok: true, receivedFor: [...seen] });
+          });
+          ws.on("error", () => { /* reported via timeout */ });
+          ws.connect()
+            .then(() => ws.subscribeMarketData(`diag-${Date.now()}`, out.candidateSlugs))
+            .catch((err) => finish({ ok: false, error: err.message }));
+        } catch (err) {
+          finish({ ok: false, error: err.message });
+        }
+      });
+      out.steps.push({ name: `websocket probe (${out.candidateSlugs.length} market(s), 6s window)`, ok: probe.ok, raw: JSON.stringify(probe) });
     }
     out.websocket = {
       connected: !!this.ws?.isConnected,
