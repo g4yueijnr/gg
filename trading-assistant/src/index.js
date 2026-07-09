@@ -48,6 +48,7 @@ async function main() {
     if (req.path === "/" || req.path.startsWith("/assets")) return next(); // UI shell is public; API is not
     const token = (req.headers.authorization || "").replace(/^Bearer /, "");
     if (token === config.appPassword) return next();
+    if (req.query.token === config.appPassword) return next(); // browser-friendly (EventSource, /api/diag)
     res.status(401).json({ error: "unauthorized" });
   });
 
@@ -121,6 +122,17 @@ async function main() {
   app.post("/api/chat/reset", (req, res) => {
     agent.resetHistory();
     res.json({ ok: true });
+  });
+
+  // Direct diagnostic: open /api/diag?q=<market text, link, or slug> in a browser
+  // (append &token=<APP_PASSWORD> if a password is set).
+  app.get("/api/diag", async (req, res) => {
+    try {
+      const q = String(req.query.q || "").trim() || "test";
+      res.json(await pm.diagnose(q));
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   });
 
   app.get("/api/health", (req, res) => {

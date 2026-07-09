@@ -33,6 +33,11 @@ export class PolymarketUSClient {
     this.wsWanted = new Set();
     this.wsReconnectDelay = 1000;
     this._wsConnecting = false;
+
+    // Poll backstop: guarantees book updates for watched markets even if the
+    // websocket is down/silent. lastBookAt tracks freshness per market.
+    this.lastBookAt = new Map();
+    this._pollTimer = null;
   }
 
   async init() {
@@ -40,6 +45,14 @@ export class PolymarketUSClient {
       console.warn("[polymarket-us] POLYMARKET_US_KEY_ID / POLYMARKET_US_SECRET_KEY not set - read-only mode (no trading).");
     } else {
       console.log("[polymarket-us] trading enabled (Polymarket US)");
+    }
+    // Connectivity self-test so hosting logs immediately show whether the
+    // exchange API is reachable from this server.
+    try {
+      await this.api.events.list({ limit: 1 });
+      console.log("[polymarket-us] API connectivity OK (public market data reachable)");
+    } catch (err) {
+      console.error(`[polymarket-us] API CONNECTIVITY FAILED: ${err.message} - market data will not work until this is resolved.`);
     }
     this.ready = true;
   }
@@ -67,7 +80,9 @@ export class PolymarketUSClient {
     const res = await this.api.search.query({ query, status: "active", limit });
     const out = [];
     for (const event of res.events || []) {
-      const markets = (event.markets || []).filter((m) => m.active && !m.closed);
+      // NB: search results may omit the `active` flag entirely - only drop
+      // markets that are explicitly inactive/closed.
+      const markets = (event.markets || []).filter((m) => m.active !== false && m.closed !== true && m.slug);
       if (!markets.length) continue;
       out.push({
         question: event.title,
@@ -121,7 +136,7 @@ export class PolymarketUSClient {
     } catch { /* not a market slug */ }
     try {
       const r = await this.api.events.retrieveBySlug(slug);
-      const markets = (r?.event?.markets || []).filter((mk) => mk.active && !mk.closed);
+      const markets = (r?.event?.markets || []).filter((mk) => mk.active !== false && mk.closed !== true && mk.slug);
       if (markets.length) {
         const result = {
           question: r.event.title,
@@ -230,6 +245,7 @@ export class PolymarketUSClient {
       lastTradePrice: this._toDollars(lastTradePx),
     };
     this.books.set(slug, { bestBid: summary.bestBid, bestAsk: summary.bestAsk, ts: Date.now() });
+    this.lastBookAt.set(slug, Date.now());
     return summary;
   }
 
@@ -365,10 +381,48 @@ export class PolymarketUSClient {
     if (this.wsWanted.has(slug)) return;
     this.wsWanted.add(slug);
     this._ensureWs(true);
+    this._ensurePolling();
   }
 
   unwatchToken(slug) {
     this.wsWanted.delete(slug);
+    if (this.wsWanted.size === 0) {
+      clearInterval(this._pollTimer);
+      this._pollTimer = null;
+    }
+  }
+
+  /**
+   * REST polling backstop. Every 3s, any watched market whose book hasn't
+   * updated (via websocket or otherwise) in >4s gets a fresh BBO fetch.
+   * With a healthy websocket this does nothing; if the socket is down or
+   * silently broken, outbid detection still works within a few seconds.
+   */
+  _ensurePolling() {
+    if (this._pollTimer) return;
+    this._pollTimer = setInterval(async () => {
+      const now = Date.now();
+      const stale = [...this.wsWanted].filter((s) => now - (this.lastBookAt.get(s) || 0) > 4000);
+      // stay well inside public rate limits even with many rules
+      for (const slug of stale.slice(0, 5)) {
+        this.lastBookAt.set(slug, now); // claim before fetch so a slow request isn't re-fetched next tick
+        try {
+          const bbo = await this.api.markets.bbo(slug);
+          const bestBid = this._toDollars(bbo?.bestBid);
+          const bestAsk = this._toDollars(bbo?.bestAsk);
+          if (bestBid === null && bestAsk === null) continue;
+          const prev = this.books.get(slug);
+          this.books.set(slug, { bestBid, bestAsk, ts: now });
+          if (!prev || prev.bestBid !== bestBid || prev.bestAsk !== bestAsk) {
+            const summary = { tokenId: slug, bestBid, bestAsk, bids: [], asks: [], tickSize: 0.01, viaPoll: true };
+            for (const fn of this.bookListeners) {
+              try { fn(summary); } catch (err) { console.error("[polymarket-us] book listener error:", err); }
+            }
+          }
+        } catch { /* transient; next tick retries */ }
+      }
+    }, 3000);
+    if (this._pollTimer.unref) this._pollTimer.unref();
   }
 
   _ensureWs(resubscribe = false) {
@@ -431,6 +485,58 @@ export class PolymarketUSClient {
 
   stop() {
     this.wsWanted.clear();
+    clearInterval(this._pollTimer);
+    this._pollTimer = null;
     try { this.ws?.close(); } catch { /* noop */ }
+  }
+
+  /**
+   * Full data-path diagnostic, runnable from the chat. Exercises every
+   * endpoint the bot depends on and returns RAW (truncated) responses so
+   * problems can be pinpointed from a live deployment.
+   */
+  async diagnose(query) {
+    const out = { platform: "us", query, steps: [] };
+    const step = async (name, fn) => {
+      try {
+        const raw = await fn();
+        out.steps.push({ name, ok: true, raw: JSON.stringify(raw)?.slice(0, 900) });
+        return raw;
+      } catch (err) {
+        out.steps.push({ name, ok: false, error: `${err.status || ""} ${err.message}`.trim() });
+        return null;
+      }
+    };
+
+    await step("connectivity: events.list(limit 1)", () => this.api.events.list({ limit: 1 }));
+    const search = await step(`search.query("${query}")`, () => this.api.search.query({ query, status: "active", limit: 3 }));
+
+    // pull candidate market slugs from search or treat query as slug/link
+    const slugs = new Set();
+    const m = String(query).trim().match(/(?:polymarket\.us\/(?:event|market)s?\/)?([a-z0-9]+(?:-[a-z0-9]+)+)\/?(?:[?#].*)?$/i);
+    if (m) slugs.add(m[1].toLowerCase());
+    for (const ev of search?.events || []) {
+      for (const mk of ev.markets || []) if (mk.slug) slugs.add(mk.slug);
+    }
+    out.candidateSlugs = [...slugs].slice(0, 3);
+
+    for (const slug of out.candidateSlugs) {
+      await step(`markets.retrieveBySlug("${slug}")`, () => this.api.markets.retrieveBySlug(slug));
+      await step(`markets.book("${slug}")`, () => this.api.markets.book(slug));
+      await step(`markets.bbo("${slug}")`, () => this.api.markets.bbo(slug));
+    }
+    if (!this.readonly) {
+      await step("auth check: account.balances()", () => this.api.account.balances());
+      await step("auth check: orders.list()", () => this.api.orders.list());
+    } else {
+      out.steps.push({ name: "auth check", ok: false, error: "skipped - no API keys configured" });
+    }
+    out.websocket = {
+      connected: !!this.ws?.isConnected,
+      watching: [...this.wsWanted],
+      lastBookAgesMs: Object.fromEntries([...this.wsWanted].map((s) => [s, this.lastBookAt.has(s) ? Date.now() - this.lastBookAt.get(s) : null])),
+      pollBackstopActive: !!this._pollTimer,
+    };
+    return out;
   }
 }

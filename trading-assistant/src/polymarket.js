@@ -355,4 +355,35 @@ export class Polymarket {
     this.wsWantedAssets.clear();
     try { this.ws?.close(); } catch { /* noop */ }
   }
+
+  /** Data-path diagnostic (global platform), runnable from the chat. */
+  async diagnose(query) {
+    const out = { platform: "global", query, steps: [] };
+    const step = async (name, fn) => {
+      try {
+        const raw = await fn();
+        out.steps.push({ name, ok: true, raw: JSON.stringify(raw)?.slice(0, 900) });
+        return raw;
+      } catch (err) {
+        out.steps.push({ name, ok: false, error: err.message });
+        return null;
+      }
+    };
+    const results = await step(`gamma search("${query}")`, () => this.searchMarkets(query, 2));
+    const tokenId = results?.[0]?.outcomes?.[0]?.tokenId;
+    if (tokenId) {
+      await step(`clob getOrderBook(${tokenId.slice(0, 16)}...)`, () => this.client.getOrderBook(tokenId));
+      await step("clob getTickSize", () => this.client.getTickSize(tokenId));
+    }
+    if (!this.readonly) {
+      await step("auth check: getOpenOrders()", () => this.client.getOpenOrders());
+    } else {
+      out.steps.push({ name: "auth check", ok: false, error: "skipped - no keys configured" });
+    }
+    out.websocket = {
+      connected: this.ws?.readyState === 1,
+      watching: [...this.wsWantedAssets].map((t) => t.slice(0, 16) + "..."),
+    };
+    return out;
+  }
 }

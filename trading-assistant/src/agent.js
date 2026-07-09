@@ -20,7 +20,7 @@ How to behave:
 - Cancel conditions ("cancel it Friday night", "pull it after 24 hours"): compute an ISO UTC datetime from the current time in <context> and pass it as expiresAt. Confirm the exact time back to the user in their terms.
 - After placing orders or creating rules, state exactly what is now resting: market, outcome, price, size, cap, and expiry if any.
 - Report failures honestly and suggest the fix (e.g. insufficient balance, price would cross the spread).
-- Order books: results may include a "note" field explaining data quality (e.g. depth unavailable, market suspended). Relay it. If a book comes back empty but the user says they can see orders in the app, NEVER insist the book is empty - tell them the API returned no data for that market and show the market title/state you found, so they can confirm it's the right one.
+- Order books: results may include a "note" field explaining data quality (e.g. depth unavailable, market suspended). Relay it. If a book comes back empty but the user says they can see orders in the app, NEVER insist the book is empty - immediately run diagnose_market on it and report which step failed with the raw evidence. The background engine reads the same data you do, so a broken book means broken outbidding: treat it as urgent, don't shrug it off.
 - Prices: users often speak in cents ("10c", "ten cents") - convert to dollars per share (0.10). Shares are also called contracts.
 - Never invent market data - always read it from tools.`;
 
@@ -129,6 +129,15 @@ function toolDefs() {
       input_schema: { type: "object", properties: {} },
     },
     {
+      name: "diagnose_market",
+      description: "Run a full data-path diagnostic against the exchange: connectivity, search, market lookup, order book, quotes, auth, and websocket state - with raw API responses. Use whenever market data looks wrong (empty books, missing markets, stale prices) or the user reports the bot 'can't see' something. Relay the failing step and raw evidence to the user.",
+      input_schema: {
+        type: "object",
+        properties: { query: { type: "string", description: "The market to test: text, polymarket link, or slug" } },
+        required: ["query"],
+      },
+    },
+    {
       name: "get_activity",
       description: "Read the recent activity log - everything the background engine did (outbids, fills, cap warnings).",
       input_schema: {
@@ -176,6 +185,7 @@ export class Agent {
       case "update_rule": return this.rules.updateRule(input.ruleId, input);
       case "cancel_rule": return this.rules.cancelRule(input.ruleId);
       case "list_rules": return this.rules.listRules();
+      case "diagnose_market": return this.pm.diagnose(input.query);
       case "get_activity": {
         const limit = input.limit || 20;
         return this.store.state.activity.slice(-limit);
