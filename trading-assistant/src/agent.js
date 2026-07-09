@@ -194,7 +194,8 @@ export class Agent {
       const messages = this.store.state.messages;
       // Ambient context rides along with the user turn.
       const contextNote =
-        `<context>now=${new Date().toISOString()} trading=${this.pm.readonly ? "DISABLED (no key configured)" : "enabled"}` +
+        `<context>now=${new Date().toISOString()} platform=${this.pm.platform === "us" ? "Polymarket US (regulated exchange)" : "Polymarket global"}` +
+        ` trading=${this.pm.readonly ? "DISABLED (no key configured)" : "enabled"}` +
         `${config.dryRun ? " DRY_RUN(orders simulated)" : ""} activeRules=${this.rules.activeRules().length}</context>`;
       messages.push({ role: "user", content: `${contextNote}\n${userText}` });
 

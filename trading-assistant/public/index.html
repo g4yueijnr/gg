@@ -263,7 +263,9 @@ async function refreshState() {
     state = await res.json();
     $("#tradedot").className = "dot" + (state.trading ? " on" : "");
     $("#tradetext").textContent = state.trading ? (state.dryRun ? "dry run" : "trading live") : "read-only";
-    $("#wallet").textContent = state.wallet ? state.wallet.slice(0, 6) + "…" + state.wallet.slice(-4) : "";
+    $("#wallet").textContent = !state.wallet ? ""
+      : state.wallet.startsWith("0x") ? state.wallet.slice(0, 6) + "…" + state.wallet.slice(-4)
+      : (state.platform === "us" ? "Polymarket US" : state.wallet);
     render();
   } catch { /* server restarting */ }
 }

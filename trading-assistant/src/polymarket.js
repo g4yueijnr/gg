@@ -22,6 +22,7 @@ function parseMaybeJsonArray(v) {
  */
 export class Polymarket {
   constructor() {
+    this.platform = "global";
     this.ready = false;
     this.readonly = true;
     this.address = null;

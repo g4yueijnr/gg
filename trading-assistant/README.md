@@ -32,17 +32,26 @@ npm install
 cp .env.example .env
 ```
 
-Open `.env` in any text editor and fill in:
+Open `.env` in any text editor and fill in `OPENAI_API_KEY` ([platform.openai.com/api-keys](https://platform.openai.com/api-keys) — powers the chat), `APP_PASSWORD` (make one up — required if you host online), and **one** of the two Polymarket setups:
+
+**If you use the Polymarket US app (regulated US version):**
 
 | Setting | Where to get it |
 |---|---|
-| `OPENAI_API_KEY` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys). Powers the chat. |
+| `POLYMARKET_US_KEY_ID` | Verify your identity in the iOS app, then create an API key at [polymarket.us/developer](https://polymarket.us/developer) |
+| `POLYMARKET_US_SECRET_KEY` | Shown once when you create the key — copy it immediately |
+
+**If you use the original polymarket.com (non-US):**
+
+| Setting | Where to get it |
+|---|---|
 | `POLYMARKET_PRIVATE_KEY` | Polymarket site → your profile picture → **Settings** → **Export Private Key** |
 | `POLYMARKET_FUNDER_ADDRESS` | The `0x...` wallet address shown on your Polymarket profile |
 | `POLYMARKET_SIGNATURE_TYPE` | `1` if you signed up with email (most people), `2` if you signed up with MetaMask |
-| `APP_PASSWORD` | Make one up. Required if you host this online. |
 
-> ⚠️ Your private key controls your funds. It only ever lives in your `.env` file on your own machine/server and is used to sign orders locally. Never share it or commit it anywhere.
+The app picks the platform automatically from which keys you provide. Note the two platforms are separate exchanges with separate accounts and order books.
+
+> ⚠️ These credentials control your funds. They only ever live in your `.env` file (or your host's encrypted variables) and are used to sign orders. Never share them or commit them anywhere.
 
 **3. Do a safe first run (simulated orders):**
 

@@ -12,7 +12,12 @@ export const config = {
   openaiApiKey: process.env.OPENAI_API_KEY || "",
   model: process.env.OPENAI_MODEL || "gpt-5.1",
 
-  // --- Polymarket credentials ---
+  // --- Polymarket US (the regulated US app) ---
+  // Get both from https://polymarket.us/developer after verifying your account in the iOS app.
+  polymarketUsKeyId: process.env.POLYMARKET_US_KEY_ID || "",
+  polymarketUsSecret: process.env.POLYMARKET_US_SECRET_KEY || "",
+
+  // --- Polymarket global (polymarket.com) credentials ---
   // Your wallet private key (exported from Polymarket: profile -> settings -> export private key)
   polymarketPrivateKey: process.env.POLYMARKET_PRIVATE_KEY || "",
   // Your Polymarket wallet address (the address shown on your Polymarket profile that holds your USDC)

@@ -4,6 +4,7 @@ import { fileURLToPath } from "url";
 import { config } from "./config.js";
 import { Store } from "./store.js";
 import { Polymarket } from "./polymarket.js";
+import { PolymarketUSClient } from "./polymarket-us.js";
 import { RulesEngine } from "./rules.js";
 import { Agent } from "./agent.js";
 
@@ -15,7 +16,10 @@ async function main() {
   }
 
   const store = new Store(config.dataDir);
-  const pm = new Polymarket();
+  // Polymarket US keys present -> US exchange; otherwise the global exchange.
+  const useUS = !!(config.polymarketUsKeyId || config.polymarketUsSecret);
+  const pm = useUS ? new PolymarketUSClient() : new Polymarket();
+  console.log(`[app] platform: Polymarket ${useUS ? "US (regulated app)" : "global (polymarket.com)"}`);
   try {
     await pm.init();
   } catch (err) {
@@ -77,6 +81,7 @@ async function main() {
     res.json({
       trading: !pm.readonly,
       dryRun: config.dryRun,
+      platform: pm.platform,
       wallet: pm.funder,
       rules: rules.listRules().slice().reverse(),
       openOrders,
