@@ -213,6 +213,8 @@ export class PolymarketUSClient {
         const summary = {
           tokenId: slug,
           bestBid, bestAsk,
+          noBestBid: bestAsk !== null ? Math.round((1 - bestAsk) * 1000) / 1000 : null,
+          noBestAsk: bestBid !== null ? Math.round((1 - bestBid) * 1000) / 1000 : null,
           bids: bestBid !== null ? [{ price: bestBid, size: bbo.bidDepth ?? null }] : [],
           asks: bestAsk !== null ? [{ price: bestAsk, size: bbo.askDepth ?? null }] : [],
           tickSize: 0.01,
@@ -266,6 +268,10 @@ export class PolymarketUSClient {
       tickSize: 0.01, // Polymarket US trades in penny increments
       lastTradePrice: this._toDollars(lastTradePx),
     };
+    // NO-side view of the same book (buying NO = shorting YES): the best NO
+    // bid mirrors the YES ask, and vice versa.
+    summary.noBestBid = summary.bestAsk !== null ? Math.round((1 - summary.bestAsk) * 1000) / 1000 : null;
+    summary.noBestAsk = summary.bestBid !== null ? Math.round((1 - summary.bestBid) * 1000) / 1000 : null;
     this.books.set(slug, { bestBid: summary.bestBid, bestAsk: summary.bestAsk, ts: Date.now() });
     this.lastBookAt.set(slug, Date.now());
     return summary;
@@ -293,22 +299,34 @@ export class PolymarketUSClient {
     }
   }
 
-  async placeOrder({ tokenId, side, price, size }) {
+  /**
+   * Place a limit order. On Polymarket US every market is the YES side of its
+   * question; NO positions are the SHORT intents on the same market.
+   *   BUY  + YES -> BUY_LONG      BUY  + NO -> BUY_SHORT
+   *   SELL + YES -> SELL_LONG     SELL + NO -> SELL_SHORT
+   * For NO orders, `price` is the NO price (what you pay per NO share).
+   */
+  async placeOrder({ tokenId, side, price, size, outcomeSide = "YES" }) {
     this._assertTradable();
     this.checkLimits({ price, size });
+    const short = String(outcomeSide).toUpperCase() === "NO";
+    const sell = String(side).toUpperCase() === "SELL";
+    const intent = short
+      ? (sell ? "ORDER_INTENT_SELL_SHORT" : "ORDER_INTENT_BUY_SHORT")
+      : (sell ? "ORDER_INTENT_SELL_LONG" : "ORDER_INTENT_BUY_LONG");
     if (config.dryRun) {
-      return { success: true, dryRun: true, orderID: `dry-${Date.now()}`, status: "live (dry run)" };
+      return { success: true, dryRun: true, orderID: `dry-${Date.now()}`, status: "live (dry run)", intent };
     }
     const resp = await this.api.orders.create({
       marketSlug: tokenId,
-      intent: side === "SELL" ? "ORDER_INTENT_SELL_LONG" : "ORDER_INTENT_BUY_LONG",
+      intent,
       type: "ORDER_TYPE_LIMIT",
       price: this._fromDollars(price),
       quantity: size,
       tif: "TIME_IN_FORCE_GOOD_TILL_CANCEL",
     });
     this.orderMarketSlugs.set(resp.id, tokenId);
-    return { success: true, orderID: resp.id };
+    return { success: true, orderID: resp.id, intent };
   }
 
   async cancelOrder(orderId) {
@@ -329,11 +347,15 @@ export class PolymarketUSClient {
     const res = await this.api.orders.list();
     return (res.orders || []).map((o) => {
       this.orderMarketSlugs.set(o.id, o.marketSlug);
+      const intent = o.intent || "";
+      const sell = intent.includes("SELL") || o.side === "ORDER_SIDE_SELL";
+      const short = intent.includes("SHORT");
       return {
         orderId: o.id,
         tokenId: o.marketSlug,
         market: o.marketMetadata?.title || o.marketSlug,
-        side: o.side === "ORDER_SIDE_SELL" ? "SELL" : "BUY",
+        side: `${sell ? "SELL" : "BUY"}${short ? " NO" : ""}`,
+        outcomeSide: short ? "NO" : "YES",
         price: this._toDollars(o.price),
         size: o.quantity,
         filled: o.cumQuantity || 0,

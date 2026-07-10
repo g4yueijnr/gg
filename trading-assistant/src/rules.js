@@ -51,7 +51,11 @@ export class RulesEngine {
    * startPrice may be omitted -> start one tick above the current best bid.
    * expiresAt (ISO datetime) may be set -> rule auto-cancels at that time.
    */
-  async createAutoOutbid({ tokenId, size, startPrice, maxPrice, marketQuestion, outcome, conditionId, expiresAt }) {
+  async createAutoOutbid({ tokenId, size, startPrice, maxPrice, marketQuestion, outcome, conditionId, expiresAt, outcomeSide }) {
+    outcomeSide = String(outcomeSide || "YES").toUpperCase() === "NO" ? "NO" : "YES";
+    if (outcomeSide === "NO" && this.pm.platform !== "us") {
+      throw new Error("On Polymarket global, bid on the No outcome by using its own tokenId - don't pass outcomeSide.");
+    }
     if (!(maxPrice > 0 && maxPrice < 1)) throw new Error("maxPrice must be between 0 and 1 (dollars per share).");
     if (startPrice !== undefined && startPrice !== null && !(startPrice > 0 && startPrice <= maxPrice)) {
       throw new Error("startPrice must be > 0 and <= maxPrice.");
@@ -66,27 +70,29 @@ export class RulesEngine {
 
     const tickSize = await this.pm.getTickSize(tokenId);
     const book = await this.pm.getOrderBook(tokenId);
+    // View the book from the side we're bidding on (NO bid = mirror of YES ask).
+    const view = sideView(outcomeSide, book.bestBid, book.bestAsk);
 
     let target;
     if (startPrice === undefined || startPrice === null) {
       // Relative start: one tick above whoever currently leads the book.
-      if (book.bestBid === null) {
+      if (view.bid === null) {
         throw new Error(
-          "There are no bids in this book right now, so 'one tick above the best bid' is undefined. " +
+          `There are no resting ${outcomeSide} bids in this book right now, so 'one tick above the best bid' is undefined. ` +
           "Give an explicit starting price instead.",
         );
       }
-      target = Math.min(round(book.bestBid + tickSize), maxPrice);
+      target = Math.min(round(view.bid + tickSize), maxPrice);
     } else {
       target = startPrice;
       // If the market already bids at/above our start price, start by outbidding it (within cap).
-      if (book.bestBid !== null && book.bestBid >= startPrice) {
-        target = Math.min(round(book.bestBid + tickSize), maxPrice);
+      if (view.bid !== null && view.bid >= startPrice) {
+        target = Math.min(round(view.bid + tickSize), maxPrice);
       }
     }
-    if (book.bestAsk !== null && target >= book.bestAsk) {
+    if (view.ask !== null && target >= view.ask) {
       throw new Error(
-        `A resting bid at ${fmt(target)} would cross the ask (${fmt(book.bestAsk)}) and fill immediately. ` +
+        `A resting ${outcomeSide} bid at ${fmt(target)} would cross the ${outcomeSide} ask (${fmt(view.ask)}) and fill immediately. ` +
         `Lower the price, or place a normal order instead if immediate fill is wanted.`,
       );
     }
@@ -99,6 +105,7 @@ export class RulesEngine {
       marketQuestion: marketQuestion || tokenId,
       outcome: outcome || "",
       side: "BUY",
+      outcomeSide,
       size,
       startPrice: target,
       maxPrice,
@@ -113,7 +120,7 @@ export class RulesEngine {
       updatedAt: new Date().toISOString(),
     };
 
-    const resp = await this.pm.placeOrder({ tokenId, side: "BUY", price: target, size });
+    const resp = await this.pm.placeOrder({ tokenId, side: "BUY", price: target, size, outcomeSide });
     rule.orderId = resp.orderID;
     rule.myPrice = target;
     this.store.state.rules.push(rule);
@@ -121,7 +128,7 @@ export class RulesEngine {
 
     this.pm.watchToken(tokenId);
     this._log(rule,
-      `Rule created: bidding ${fmt(target)} for ${size} shares of "${rule.outcome}" - will auto-outbid up to ${fmt(maxPrice)}` +
+      `Rule created: bidding ${fmt(target)} for ${size} ${outcomeSide === "NO" ? "NO " : ""}shares of "${rule.outcome}" - will auto-outbid up to ${fmt(maxPrice)}` +
       `${rule.expiresAt ? `, auto-cancels ${new Date(rule.expiresAt).toUTCString()}` : ""}.`);
     return rule;
   }
@@ -170,8 +177,8 @@ export class RulesEngine {
     this._log(rule, `Rule updated: max price now ${fmt(rule.maxPrice)}, size ${rule.size}.`);
     // Re-evaluate immediately against the latest known book
     const book = this.pm.books.get(rule.tokenId);
-    if (book && book.bestBid !== null) {
-      this._enqueue(rule.id, () => this._evaluate(rule, book.bestBid));
+    if (book) {
+      this._enqueue(rule.id, () => this._evaluate(rule, book.bestBid, book.bestAsk));
     }
     return rule;
   }
@@ -179,11 +186,11 @@ export class RulesEngine {
   // ---------- reactions ----------
 
   _onBook(summary) {
-    const { tokenId, bestBid } = summary;
-    if (bestBid === null || bestBid === undefined) return;
+    const { tokenId, bestBid, bestAsk } = summary;
     for (const rule of this.activeRules()) {
       if (rule.tokenId !== tokenId) continue;
-      this._enqueue(rule.id, () => this._evaluate(rule, bestBid, summary.bestAsk));
+      // NO rules react to ask moves, YES rules to bid moves - _evaluate sorts it out.
+      this._enqueue(rule.id, () => this._evaluate(rule, bestBid, bestAsk));
     }
   }
 
@@ -211,9 +218,14 @@ export class RulesEngine {
     return true;
   }
 
-  async _evaluate(rule, bestBid, bestAsk = null) {
+  async _evaluate(rule, rawBestBid, rawBestAsk = null) {
     if (rule.status !== "active" || rule.myPrice === null) return;
     if (await this._expireIfDue(rule)) return;
+    // Convert the market book into the side this rule bids on
+    // (for NO rules the best NO bid mirrors the YES ask).
+    const view = sideView(rule.outcomeSide, rawBestBid, rawBestAsk);
+    const bestBid = view.bid;
+    if (bestBid === null || bestBid === undefined) return;
     if (bestBid <= rule.myPrice) return; // we're still on top (or tied at our own level)
 
     // Someone outbid us.
@@ -241,13 +253,14 @@ export class RulesEngine {
 
     // Re-check the freshest book we have before acting.
     const latest = this.pm.books.get(rule.tokenId);
-    const freshBid = latest?.bestBid ?? bestBid;
+    const freshView = latest ? sideView(rule.outcomeSide, latest.bestBid, latest.bestAsk) : view;
+    const freshBid = freshView.bid ?? bestBid;
     if (freshBid <= rule.myPrice) return;
     const freshTarget = round(Math.min(freshBid + tick, rule.maxPrice));
     if (freshTarget <= rule.myPrice) return;
 
     // Don't cross the spread with the repost.
-    const ask = latest?.bestAsk ?? bestAsk;
+    const ask = freshView.ask ?? view.ask;
     if (ask !== null && ask !== undefined && freshTarget >= ask) {
       if (!rule.cappedNotified) {
         rule.cappedNotified = true;
@@ -281,7 +294,7 @@ export class RulesEngine {
         return; // retry on the next book update
       }
     }
-    const resp = await this.pm.placeOrder({ tokenId: rule.tokenId, side: "BUY", price: freshTarget, size: remaining });
+    const resp = await this.pm.placeOrder({ tokenId: rule.tokenId, side: "BUY", price: freshTarget, size: remaining, outcomeSide: rule.outcomeSide });
     const oldPrice = rule.myPrice;
     rule.orderId = resp.orderID;
     rule.myPrice = freshTarget;
@@ -381,6 +394,21 @@ export class RulesEngine {
 
 function round(p) {
   return Math.round(p * 1000) / 1000;
+}
+
+/**
+ * View a market's best bid/ask from the side being bid on. For YES it's the
+ * book as-is; for NO, prices mirror across $1: the best NO bid is what the
+ * best YES ask implies, and vice versa.
+ */
+function sideView(outcomeSide, bestBid, bestAsk) {
+  if (outcomeSide !== "NO") {
+    return { bid: bestBid ?? null, ask: bestAsk ?? null };
+  }
+  return {
+    bid: bestAsk !== null && bestAsk !== undefined ? round(1 - bestAsk) : null,
+    ask: bestBid !== null && bestBid !== undefined ? round(1 - bestBid) : null,
+  };
 }
 function fmt(p) {
   if (p === null || p === undefined) return "?";

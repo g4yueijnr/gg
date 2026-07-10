@@ -23,6 +23,7 @@ How to behave:
 - Order books: results may include a "note" field explaining data quality (e.g. depth unavailable, market suspended). Relay it. If a book comes back empty but the user says they can see orders in the app, NEVER insist the book is empty - immediately run diagnose_market on it and report which step failed with the raw evidence. The background engine reads the same data you do, so a broken book means broken outbidding: treat it as urgent, don't shrug it off.
 - Empty book but the app shows a price? The app can display last-trade or indicative odds even when NO orders are resting. Ask the user to open the market's order book/depth view in the app and read you an actual bid - if there are no resting bids, the book really is empty and an auto-outbid rule needs an explicit starting price (there is nobody to outbid yet).
 - Prices: users often speak in cents ("10c", "ten cents") - convert to dollars per share (0.10). Shares are also called contracts.
+- YES vs NO on Polymarket US: every market is the YES side of its question. "Buy NO" = side BUY + outcomeSide NO at the NO price (buying 100 NO at 0.60 costs $60 and pays $100 if the answer is no). NEVER translate "buy NO" into a SELL - SELL means exiting shares already owned. Order books include noBestBid/noBestAsk showing the live NO-side prices; use those when quoting NO markets. On Polymarket global, No is a separate outcome token - trade it via its own tokenId.
 - Never invent market data - always read it from tools.`;
 
 /** Tool definitions (Anthropic format). */
@@ -48,12 +49,13 @@ function toolDefs() {
     },
     {
       name: "place_order",
-      description: "Place a limit order (GTC). price is dollars per share, e.g. 0.10 for 10 cents. size is number of shares/contracts.",
+      description: "Place a limit order (GTC). price is dollars per share, e.g. 0.10 for 10 cents. size is number of shares/contracts. On Polymarket US, 'buy NO' is side=BUY + outcomeSide=NO with the NO price - NEVER a SELL (selling exits shares you own).",
       input_schema: {
         type: "object",
         properties: {
           tokenId: { type: "string" },
-          side: { type: "string", enum: ["BUY", "SELL"] },
+          side: { type: "string", enum: ["BUY", "SELL"], description: "BUY opens/adds a position, SELL exits one you own" },
+          outcomeSide: { type: "string", enum: ["YES", "NO"], description: "Polymarket US only: which side of the market. Default YES. For NO, price is the NO price. On Polymarket global, use the No outcome's own tokenId instead." },
           price: { type: "number" },
           size: { type: "number" },
         },
@@ -94,6 +96,7 @@ function toolDefs() {
           size: { type: "number", description: "Shares/contracts to buy" },
           startPrice: { type: "number", description: "Initial bid in dollars per share (0.10 = 10c). OMIT to start one tick above the current best bid." },
           maxPrice: { type: "number", description: "Hard cap in dollars per share (0.60 = 60c)" },
+          outcomeSide: { type: "string", enum: ["YES", "NO"], description: "Polymarket US only: bid on YES (default) or NO. For NO, all prices are NO prices and the engine outbids competing NO bidders. On Polymarket global, use the No outcome's own tokenId instead." },
           expiresAt: { type: "string", description: "Optional ISO 8601 UTC datetime when the rule should auto-cancel itself and pull the order, e.g. 2026-07-12T21:00:00Z. Compute it from the current time in <context> when the user says things like 'cancel it Friday' or 'kill it after 24 hours'." },
           marketQuestion: { type: "string", description: "The market question, for display" },
           outcome: { type: "string", description: "Outcome name, e.g. Yes/No" },

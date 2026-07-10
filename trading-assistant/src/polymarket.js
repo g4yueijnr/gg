@@ -194,8 +194,13 @@ export class Polymarket {
   /**
    * Place a limit order. price is in dollars per share (0.10 = 10 cents).
    */
-  async placeOrder({ tokenId, side, price, size, orderType = "GTC" }) {
+  async placeOrder({ tokenId, side, price, size, orderType = "GTC", outcomeSide }) {
     this._assertTradable();
+    if (outcomeSide && String(outcomeSide).toUpperCase() === "NO") {
+      throw new Error(
+        "On Polymarket global, No is its own token - trade it by using the No outcome's tokenId from search results instead of outcomeSide.",
+      );
+    }
     this.checkLimits({ price, size });
     if (config.dryRun) {
       return { success: true, dryRun: true, orderID: `dry-${Date.now()}`, status: "live (dry run)" };
