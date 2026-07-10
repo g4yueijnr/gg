@@ -358,15 +358,20 @@ export class Polymarket {
       const summary = this._summarizeBook(tokenId, ev);
       this._emitBook(tokenId, summary);
     } else if (type === "price_change") {
-      // levels changed; we don't get the full book, so fetch cheaply via REST is
-      // wasteful - instead derive best bid/ask from the reported changes when possible,
-      // falling back to a REST refresh.
+      // Levels changed. Coalesce refreshes per token (max one in-flight REST
+      // fetch per 250ms) so bursts of price changes can't stampede the API or
+      // deliver out-of-order snapshots.
       const changes = ev.changes || ev.price_changes || [];
       const tokenId = ev.asset_id || changes[0]?.asset_id;
       if (!tokenId) return;
-      this.getOrderBook(tokenId)
-        .then((summary) => this._emitBook(tokenId, summary))
-        .catch(() => { /* transient */ });
+      this._refetchTimers ||= new Map();
+      if (this._refetchTimers.has(tokenId)) return; // refresh already scheduled
+      this._refetchTimers.set(tokenId, setTimeout(() => {
+        this._refetchTimers.delete(tokenId);
+        this.getOrderBook(tokenId)
+          .then((summary) => this._emitBook(tokenId, summary))
+          .catch(() => { /* transient */ });
+      }, 250));
     } else if (type === "tick_size_change") {
       // rules engine re-reads tick size on each repost; nothing to do here
     }

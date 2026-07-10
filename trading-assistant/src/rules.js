@@ -360,9 +360,10 @@ export class RulesEngine {
     this.store.save();
     this._armExpiry(rule);
     this._log(rule, `Rule updated: max price now ${fmt(rule.maxPrice)}, size ${rule.size}.`);
-    // Re-evaluate immediately against the latest known book
+    // Re-evaluate immediately against the latest known book - but never act
+    // on stale cached data (fresh events will re-trigger evaluation anyway).
     const book = this.pm.books.get(rule.tokenId);
-    if (book) {
+    if (book && Date.now() - (book.ts || 0) < 30000) {
       this._enqueue(rule.id, () => this._evaluate(rule, book.bestBid, book.bestAsk));
     }
     return rule;
