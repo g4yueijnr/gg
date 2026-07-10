@@ -73,6 +73,12 @@ export class RulesEngine {
     const worstExposure = maxCostUsd ? Math.min(maxCostUsd, size * maxPrice) : size * maxPrice;
     this.pm.checkLimits({ price: worstExposure / size, size });
 
+    // Pin the rule to the exchange's canonical market id so the 24/7 engine
+    // never watches or bids against a stale identifier.
+    if (this.pm.canonicalTokenId) {
+      tokenId = await this.pm.canonicalTokenId(tokenId);
+    }
+
     const tickSize = await this.pm.getTickSize(tokenId);
     const book = await this.pm.getOrderBook(tokenId);
     // View the book from the side we're bidding on (NO bid = mirror of YES ask).

@@ -67,6 +67,8 @@ export class PolymarketUSClient {
     this.books = new Map();           // slug -> {bestBid, bestAsk, ts}
     this.bookListeners = new Set();
     this.orderMarketSlugs = new Map(); // orderId -> marketSlug (cancel needs both)
+    this._slugOk = new Set();          // slugs confirmed tradable
+    this._slugAlias = new Map();       // short/stale slug -> canonical tradable slug
 
     this.ws = null;
     this.wsWanted = new Set();
@@ -126,6 +128,43 @@ export class PolymarketUSClient {
 
   // ---------- market discovery ----------
 
+  /**
+   * Resolve a market identifier to the exchange's canonical tradable slug.
+   * The exchange knows markets under prefixed slugs (e.g. "astatc-ufc-...")
+   * while search/event payloads sometimes hand out shortened variants that
+   * 404 everywhere. Verify once, repair if needed, cache the answer.
+   */
+  async canonicalTokenId(slug) {
+    if (!slug) return slug;
+    if (this._slugOk.has(slug)) return slug;
+    if (this._slugAlias.has(slug)) return this._slugAlias.get(slug);
+    try {
+      const r = await this.api.markets.retrieveBySlug(slug);
+      const real = (r?.market || r)?.slug || slug;
+      this._slugOk.add(real);
+      if (real !== slug) this._slugAlias.set(slug, real);
+      return real;
+    } catch (err) {
+      if (err?.status !== 404) return slug; // transient - use as-is, retry later
+    }
+    // 404: hunt for the market whose canonical slug contains/ends with ours.
+    try {
+      const res = await this.api.search.query({ query: slug.replace(/-/g, " "), limit: 5 });
+      for (const ev of res?.events || []) {
+        for (const mk of ev.markets || []) {
+          if (!mk.slug) continue;
+          if (mk.slug === slug || mk.slug.endsWith(`-${slug}`) || mk.slug.endsWith(slug) || slug.endsWith(mk.slug)) {
+            this._slugOk.add(mk.slug);
+            this._slugAlias.set(slug, mk.slug);
+            console.log(`[polymarket-us] resolved market id "${slug}" -> "${mk.slug}"`);
+            return mk.slug;
+          }
+        }
+      }
+    } catch { /* fall through */ }
+    return slug; // caller's error paths will explain
+  }
+
   async searchMarkets(query, limit = 8) {
     // Pasted a polymarket.us link or an exact slug? Resolve it directly.
     const direct = await this._resolveDirect(query);
@@ -155,18 +194,21 @@ export class PolymarketUSClient {
     const results = out.slice(0, limit);
     // Search truncates each event's market list - fetch full events so every
     // prop (e.g. "before round 4") is present, not just the popular ones.
+    // MERGE, never replace: slugs straight from search are the exchange's
+    // canonical ones; event payloads sometimes carry shortened variants.
     await Promise.all(results.slice(0, 3).map(async (r) => {
       if (!r.slug) return;
       try {
         const full = await this.api.events.retrieveBySlug(r.slug);
         const markets = (full?.event?.markets || []).filter((mk) => mk.active !== false && mk.closed !== true && mk.slug);
-        if (markets.length > r.outcomes.length) {
-          r.outcomes = markets.slice(0, 25).map((mk) => ({
-            outcome: mk.outcome || mk.title,
-            marketTitle: mk.title,
-            tokenId: mk.slug,
-          }));
-        }
+        const known = r.outcomes.map((o) => o.tokenId);
+        const extras = markets.filter((mk) =>
+          !known.some((k) => k === mk.slug || k.endsWith(mk.slug) || mk.slug.endsWith(k)));
+        r.outcomes = r.outcomes.concat(extras.map((mk) => ({
+          outcome: mk.outcome || mk.title,
+          marketTitle: mk.title,
+          tokenId: mk.slug,
+        }))).slice(0, 25);
       } catch { /* keep the search-provided subset */ }
     }));
     await this._attachQuotes(results);
@@ -182,7 +224,23 @@ export class PolymarketUSClient {
         o.bestBid = this._toDollars(bbo.bestBid);
         o.bestAsk = this._toDollars(bbo.bestAsk);
         o.lastPrice = this._toDollars(bbo.lastTradePx);
-      } catch { /* quote unavailable; leave blank */ }
+        this._slugOk.add(o.tokenId); // quotes answered -> slug is tradable
+      } catch (err) {
+        // A 404 here means this outcome's slug is a shortened variant -
+        // repair it in place so the assistant only ever sees good ids.
+        if (err?.status === 404) {
+          const fixed = await this.canonicalTokenId(o.tokenId);
+          if (fixed !== o.tokenId) {
+            o.tokenId = fixed;
+            try {
+              const bbo = unwrapBbo(await this.api.markets.bbo(fixed));
+              o.bestBid = this._toDollars(bbo.bestBid);
+              o.bestAsk = this._toDollars(bbo.bestAsk);
+              o.lastPrice = this._toDollars(bbo.lastTradePx);
+            } catch { /* quote unavailable; id is still fixed */ }
+          }
+        }
+      }
     }));
   }
 
@@ -237,7 +295,12 @@ export class PolymarketUSClient {
 
   // ---------- order book / prices ----------
 
-  async getOrderBook(slug) {
+  async getOrderBook(slug, _retried = false) {
+    // Resolve shortened/stale market ids to the canonical tradable slug first.
+    if (!this._slugOk.has(slug)) {
+      const fixed = await this.canonicalTokenId(slug);
+      if (fixed !== slug) slug = fixed;
+    }
     // Primary: full depth from the book endpoint (normalized across the
     // envelope/field-name variants the exchange may use).
     let book = null;
@@ -359,6 +422,7 @@ export class PolymarketUSClient {
   async placeOrder({ tokenId, side, price, size, outcomeSide = "YES" }) {
     this._assertTradable();
     this.checkLimits({ price, size });
+    tokenId = await this.canonicalTokenId(tokenId); // never order against a stale id
     const short = String(outcomeSide).toUpperCase() === "NO";
     const sell = String(side).toUpperCase() === "SELL";
     const intent = short
