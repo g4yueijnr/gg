@@ -39,9 +39,31 @@ export class Polymarket {
     this.books = new Map(); // tokenId -> {bestBid, bestAsk, ts}
   }
 
+  async _connectivityCheck() {
+    try {
+      const res = await Promise.race([
+        this.client.getOk(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout after 6s")), 6000)),
+      ]);
+      // The clob client can return error OBJECTS instead of throwing - a bare
+      // "no throw" is not proof of connectivity. Verify the response shape.
+      const failed = res && typeof res === "object" && (res.error || res.errorMsg || Number(res.status) >= 400);
+      if (failed) {
+        throw new Error(String(res.error || res.errorMsg || `status ${res.status}`).slice(0, 160));
+      }
+      this.apiOk = true;
+      console.log("[polymarket] API connectivity OK");
+    } catch (err) {
+      this.apiOk = false;
+      this.apiError = err.message;
+      console.error(`[polymarket] API CONNECTIVITY FAILED: ${err.message}`);
+    }
+  }
+
   async init() {
     if (!config.polymarketPrivateKey) {
       console.warn("[polymarket] POLYMARKET_PRIVATE_KEY not set - running in read-only mode (no trading).");
+      await this._connectivityCheck();
       this.ready = true;
       return;
     }
@@ -61,6 +83,7 @@ export class Polymarket {
       config.polymarketFunderAddress || undefined,
     );
     this.readonly = false;
+    await this._connectivityCheck();
     this.ready = true;
     console.log(`[polymarket] trading enabled for ${this.funder} (signature type ${config.polymarketSignatureType})`);
   }

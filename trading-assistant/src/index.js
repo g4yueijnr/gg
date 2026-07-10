@@ -39,6 +39,22 @@ async function main() {
   rules.start();
   const agent = new Agent({ polymarket: pm, rules, store });
 
+  // Self-report health into the Activity feed so status is visible in the app
+  // itself - no log-digging or manual testing needed.
+  {
+    const parts = [
+      `platform: Polymarket ${useUS ? "US" : "global"}`,
+      pm.readonly ? "trading: OFF (no exchange keys)" : "trading: ON",
+      config.dryRun ? "DRY RUN (orders simulated)" : null,
+      pm.apiOk === false ? `⚠ exchange API UNREACHABLE: ${pm.apiError || "unknown"}` : "exchange API: OK",
+      config.anthropicApiKey ? "chat: OK" : "⚠ chat: ANTHROPIC_API_KEY missing",
+      `${rules.activeRules().length} active rule(s) resumed`,
+    ].filter(Boolean);
+    store.addActivity("system", `App started - ${parts.join(" · ")}`, {
+      level: (pm.apiOk === false || !config.anthropicApiKey) ? "warn" : "info",
+    });
+  }
+
   const app = express();
   app.use(express.json({ limit: "1mb" }));
 

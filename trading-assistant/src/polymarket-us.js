@@ -50,8 +50,11 @@ export class PolymarketUSClient {
     // exchange API is reachable from this server.
     try {
       await this.api.events.list({ limit: 1 });
+      this.apiOk = true;
       console.log("[polymarket-us] API connectivity OK (public market data reachable)");
     } catch (err) {
+      this.apiOk = false;
+      this.apiError = err.message;
       console.error(`[polymarket-us] API CONNECTIVITY FAILED: ${err.message} - market data will not work until this is resolved.`);
     }
     this.ready = true;
@@ -61,8 +64,10 @@ export class PolymarketUSClient {
     if (amount === undefined || amount === null) return null;
     const v = Number(typeof amount === "object" ? amount.value : amount);
     if (Number.isNaN(v)) return null;
-    if (v > 1) this.priceScale = 100; // must be cents - these contracts never exceed $1
-    return this.priceScale === 100 || v > 1 ? v / 100 : v;
+    // These contracts always trade strictly below $1, so any value >= 1 must be
+    // cents quoting (e.g. "55" = 55c, and "1" = 1c - never $1).
+    if (v >= 1) this.priceScale = 100;
+    return this.priceScale === 100 || v >= 1 ? v / 100 : v;
   }
 
   _fromDollars(price) {
@@ -215,6 +220,7 @@ export class PolymarketUSClient {
           note: "Full depth unavailable from the book endpoint - showing live best bid/ask.",
         };
         this.books.set(slug, { bestBid, bestAsk, ts: Date.now() });
+        this.lastBookAt.set(slug, Date.now());
         return summary;
       }
     } catch { /* fall through to diagnosis */ }
