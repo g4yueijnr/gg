@@ -227,7 +227,8 @@ function render() {
       div.innerHTML =
         `${(r.status === "active" || r.status === "capped") ? '<button class="mini" data-rule="' + esc(r.id) + '">stop</button>' : ""}` +
         `<div class="title">${r.outcomeSide === "NO" ? "NO on " : ""}${esc(r.outcome || "")} · ${esc(r.marketQuestion || "")}<span class="badge ${esc(r.status)}">${esc(r.status)}</span></div>` +
-        `<div class="sub">my bid ${fmtC(r.myPrice)} · cap ${fmtC(r.maxPrice)} · ${r.size} shares` +
+        `<div class="sub">my bid ${fmtC(r.myPrice)}${r.mySize && r.mySize !== r.size ? ` × ${r.mySize}` : ""} · cap ${fmtC(r.maxPrice)} · ${r.size} shares` +
+        `${r.maxCostUsd ? ` · budget $${r.maxCostUsd}${r.spentUsd ? ` ($${r.spentUsd} used)` : ""}` : ""}` +
         `${r.filledSize ? ` · filled ${r.filledSize}` : ""}` +
         `${r.expiresAt ? ` · auto-cancels ${new Date(r.expiresAt).toLocaleString()}` : ""} · ${esc(r.id)}</div>`;
       panel.appendChild(div);

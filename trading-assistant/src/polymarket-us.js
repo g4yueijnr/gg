@@ -2,6 +2,36 @@ import { PolymarketUS } from "polymarket-us";
 import { config } from "./config.js";
 
 /**
+ * The exchange's REST/WS payloads are enveloped inconsistently (and the SDK's
+ * declared types don't always match the wire format - most endpoints wrap
+ * their payload, e.g. {market: {...}}, {order: {...}}). Accept every plausible
+ * shape so a wrapper or renamed field can never read as an "empty book" again.
+ */
+function unwrapBook(raw) {
+  const b = raw?.book || raw?.marketBook || raw?.market_book || raw?.data || raw || {};
+  return {
+    bids: b.bids || b.buys || [],
+    asks: b.offers || b.asks || b.sells || [],
+    stats: b.stats,
+    state: b.state,
+  };
+}
+
+function unwrapBbo(raw) {
+  const b = raw?.bbo || raw?.marketBbo || raw?.market_bbo || raw?.data || raw || {};
+  return {
+    bestBid: b.bestBid ?? b.best_bid ?? b.bid,
+    bestAsk: b.bestAsk ?? b.best_ask ?? b.ask ?? b.offer,
+    bidDepth: b.bidDepth ?? b.bid_depth,
+    askDepth: b.askDepth ?? b.ask_depth,
+    lastTradePx: b.lastTradePx ?? b.last_trade_px ?? b.lastTradePrice,
+  };
+}
+
+function levelPrice(l) { return l.px ?? l.price ?? l.p; }
+function levelQty(l) { return l.qty ?? l.quantity ?? l.size ?? l.q; }
+
+/**
  * Polymarket US (the CFTC-regulated exchange behind the US app) client.
  * Exposes the exact same interface as the global client in polymarket.js,
  * so the rules engine / agent / server don't care which one is running.
@@ -62,7 +92,17 @@ export class PolymarketUSClient {
 
   _toDollars(amount) {
     if (amount === undefined || amount === null) return null;
-    const v = Number(typeof amount === "object" ? amount.value : amount);
+    let v;
+    if (typeof amount === "object") {
+      if (amount.units !== undefined || amount.nanos !== undefined) {
+        // protobuf-style Money: {units, nanos}
+        v = Number(amount.units || 0) + Number(amount.nanos || 0) / 1e9;
+      } else {
+        v = Number(amount.value ?? amount.amount ?? amount.px);
+      }
+    } else {
+      v = Number(amount);
+    }
     if (Number.isNaN(v)) return null;
     // These contracts always trade strictly below $1, so any value >= 1 must be
     // cents quoting (e.g. "55" = 55c, and "1" = 1c - never $1).
@@ -129,10 +169,10 @@ export class PolymarketUSClient {
     const outcomes = results.flatMap((r) => r.outcomes).slice(0, 12);
     await Promise.all(outcomes.map(async (o) => {
       try {
-        const bbo = await this.api.markets.bbo(o.tokenId);
-        o.bestBid = this._toDollars(bbo?.bestBid);
-        o.bestAsk = this._toDollars(bbo?.bestAsk);
-        o.lastPrice = this._toDollars(bbo?.lastTradePx);
+        const bbo = unwrapBbo(await this.api.markets.bbo(o.tokenId));
+        o.bestBid = this._toDollars(bbo.bestBid);
+        o.bestAsk = this._toDollars(bbo.bestAsk);
+        o.lastPrice = this._toDollars(bbo.lastTradePx);
       } catch { /* quote unavailable; leave blank */ }
     }));
   }
@@ -189,16 +229,17 @@ export class PolymarketUSClient {
   // ---------- order book / prices ----------
 
   async getOrderBook(slug) {
-    // Primary: full depth from the book endpoint.
+    // Primary: full depth from the book endpoint (normalized across the
+    // envelope/field-name variants the exchange may use).
     let book = null;
     let bookErr = null;
     try {
-      book = await this.api.markets.book(slug);
+      book = unwrapBook(await this.api.markets.book(slug));
     } catch (err) {
       bookErr = err;
     }
-    if (book && ((book.bids && book.bids.length) || (book.offers && book.offers.length))) {
-      const s = this._summarizeBook(slug, book.bids || [], book.offers || [], book.stats?.lastTradePx);
+    if (book && (book.bids.length || book.asks.length)) {
+      const s = this._summarizeBook(slug, book.bids, book.asks, book.stats?.lastTradePx);
       s.state = book.state;
       return s;
     }
@@ -206,9 +247,9 @@ export class PolymarketUSClient {
     // Fallback: best bid/offer endpoint (some deployments serve quotes here even
     // when the depth endpoint comes back empty).
     try {
-      const bbo = await this.api.markets.bbo(slug);
-      const bestBid = this._toDollars(bbo?.bestBid);
-      const bestAsk = this._toDollars(bbo?.bestAsk);
+      const bbo = unwrapBbo(await this.api.markets.bbo(slug));
+      const bestBid = this._toDollars(bbo.bestBid);
+      const bestAsk = this._toDollars(bbo.bestAsk);
       if (bestBid !== null || bestAsk !== null) {
         const summary = {
           tokenId: slug,
@@ -218,7 +259,7 @@ export class PolymarketUSClient {
           bids: bestBid !== null ? [{ price: bestBid, size: bbo.bidDepth ?? null }] : [],
           asks: bestAsk !== null ? [{ price: bestAsk, size: bbo.askDepth ?? null }] : [],
           tickSize: 0.01,
-          lastTradePrice: this._toDollars(bbo?.lastTradePx),
+          lastTradePrice: this._toDollars(bbo.lastTradePx),
           note: "Full depth unavailable from the book endpoint - showing live best bid/ask.",
         };
         this.books.set(slug, { bestBid, bestAsk, ts: Date.now() });
@@ -253,10 +294,10 @@ export class PolymarketUSClient {
   }
 
   _summarizeBook(slug, rawBids, rawAsks, lastTradePx) {
-    const bids = rawBids.map((l) => ({ price: this._toDollars(l.px), size: Number(l.qty) }))
+    const bids = rawBids.map((l) => ({ price: this._toDollars(levelPrice(l)), size: Number(levelQty(l)) }))
       .filter((l) => l.price !== null)
       .sort((a, b) => b.price - a.price);
-    const asks = rawAsks.map((l) => ({ price: this._toDollars(l.px), size: Number(l.qty) }))
+    const asks = rawAsks.map((l) => ({ price: this._toDollars(levelPrice(l)), size: Number(levelQty(l)) }))
       .filter((l) => l.price !== null)
       .sort((a, b) => a.price - b.price);
     const summary = {
@@ -451,9 +492,9 @@ export class PolymarketUSClient {
       for (const slug of stale.slice(0, 5)) {
         this.lastBookAt.set(slug, now); // claim before fetch so a slow request isn't re-fetched next tick
         try {
-          const bbo = await this.api.markets.bbo(slug);
-          const bestBid = this._toDollars(bbo?.bestBid);
-          const bestAsk = this._toDollars(bbo?.bestAsk);
+          const bbo = unwrapBbo(await this.api.markets.bbo(slug));
+          const bestBid = this._toDollars(bbo.bestBid);
+          const bestAsk = this._toDollars(bbo.bestAsk);
           if (bestBid === null && bestAsk === null) continue;
           const prev = this.books.get(slug);
           this.books.set(slug, { bestBid, bestAsk, ts: now });
@@ -485,9 +526,11 @@ export class PolymarketUSClient {
       const ws = this.api.ws.markets();
       this.ws = ws;
       ws.on("marketData", (msg) => {
-        const d = msg.marketData;
-        if (!d?.marketSlug) return;
-        const summary = this._summarizeBook(d.marketSlug, d.bids || [], d.offers || [], d.stats?.lastTradePx);
+        const d = msg.marketData || msg.market_data || msg.data || msg;
+        const slug = d?.marketSlug || d?.market_slug;
+        if (!slug) return;
+        const nb = unwrapBook(d);
+        const summary = this._summarizeBook(slug, nb.bids, nb.asks, nb.stats?.lastTradePx);
         for (const fn of this.bookListeners) {
           try { fn(summary); } catch (err) { console.error("[polymarket-us] book listener error:", err); }
         }

@@ -17,6 +17,7 @@ How to behave:
 - Always resolve a market via search_markets first and confirm you have the right outcome token before trading. If several markets plausibly match, show the top candidates and ask.
 - "Outbid up to X" instructions are standing rules -> use create_auto_outbid_rule, not a one-off order.
 - "One cent above the current highest bid" style instructions: omit startPrice on create_auto_outbid_rule - the engine reads the live book and starts one tick above the best bid at placement time. Don't read the book yourself and hardcode a price for this; the omitted-startPrice path is more accurate.
+- Budget instructions ("1000 contracts at 5c, bid up to 30c, but never spend more than $150"): one rule with size=1000, startPrice=0.05, maxPrice=0.30, maxCostUsd=150. The engine shrinks the size automatically as the price climbs so spend never exceeds the budget - don't create multiple rules or do the size math yourself.
 - Cancel conditions ("cancel it Friday night", "pull it after 24 hours"): compute an ISO UTC datetime from the current time in <context> and pass it as expiresAt. Confirm the exact time back to the user in their terms.
 - After placing orders or creating rules, state exactly what is now resting: market, outcome, price, size, cap, and expiry if any.
 - Report failures honestly and suggest the fix (e.g. insufficient balance, price would cross the spread).
@@ -97,6 +98,7 @@ function toolDefs() {
           startPrice: { type: "number", description: "Initial bid in dollars per share (0.10 = 10c). OMIT to start one tick above the current best bid." },
           maxPrice: { type: "number", description: "Hard cap in dollars per share (0.60 = 60c)" },
           outcomeSide: { type: "string", enum: ["YES", "NO"], description: "Polymarket US only: bid on YES (default) or NO. For NO, all prices are NO prices and the engine outbids competing NO bidders. On Polymarket global, use the No outcome's own tokenId instead." },
+          maxCostUsd: { type: "number", description: "Optional total dollar budget for the rule. As the price rises, the engine automatically shrinks the order size so price x size never exceeds this (e.g. size 1000 with $150 budget: 1000 contracts at 5c, ~500 at 30c). Use when the user says 'don't spend more than $X'." },
           expiresAt: { type: "string", description: "Optional ISO 8601 UTC datetime when the rule should auto-cancel itself and pull the order, e.g. 2026-07-12T21:00:00Z. Compute it from the current time in <context> when the user says things like 'cancel it Friday' or 'kill it after 24 hours'." },
           marketQuestion: { type: "string", description: "The market question, for display" },
           outcome: { type: "string", description: "Outcome name, e.g. Yes/No" },
