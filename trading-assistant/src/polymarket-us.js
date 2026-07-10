@@ -31,6 +31,15 @@ function unwrapBbo(raw) {
 function levelPrice(l) { return l.px ?? l.price ?? l.p; }
 function levelQty(l) { return l.qty ?? l.quantity ?? l.size ?? l.q; }
 
+/** Price encodings the exchange might expect, in order of preference. */
+function priceCandidates(price, priceScale) {
+  const dollars = { value: String(Math.round(price * 100) / 100), currency: "USD" };
+  const cents = { value: String(Math.round(price * 100)), currency: "USD" };
+  const units = Math.floor(price);
+  const money = { units, nanos: Math.round((price - units) * 1e9), currency: "USD" };
+  return priceScale === 100 ? [cents, dollars, money] : [dollars, cents, money];
+}
+
 /**
  * Polymarket US (the CFTC-regulated exchange behind the US app) client.
  * Exposes the exact same interface as the global client in polymarket.js,
@@ -356,18 +365,60 @@ export class PolymarketUSClient {
       ? (sell ? "ORDER_INTENT_SELL_SHORT" : "ORDER_INTENT_BUY_SHORT")
       : (sell ? "ORDER_INTENT_SELL_LONG" : "ORDER_INTENT_BUY_LONG");
     if (config.dryRun) {
-      return { success: true, dryRun: true, orderID: `dry-${Date.now()}`, status: "live (dry run)", intent };
+      return { success: true, dryRun: true, orderID: `dry-${Date.now()}`, status: "SIMULATED - DRY_RUN is on, no real order was sent", intent };
     }
-    const resp = await this.api.orders.create({
+    const base = {
       marketSlug: tokenId,
       intent,
       type: "ORDER_TYPE_LIMIT",
-      price: this._fromDollars(price),
       quantity: size,
       tif: "TIME_IN_FORCE_GOOD_TILL_CANCEL",
-    });
-    this.orderMarketSlugs.set(resp.id, tokenId);
-    return { success: true, orderID: resp.id, intent };
+    };
+
+    // Try price encodings until the exchange accepts (rotate only on HTTP 400
+    // validation rejects - anything else propagates). Remember what worked.
+    const candidates = priceCandidates(price, this.priceScale);
+    if (this._priceFormatIdx !== undefined) {
+      candidates.unshift(candidates.splice(this._priceFormatIdx, 1)[0]);
+    }
+    let resp = null;
+    let lastErr = null;
+    for (let i = 0; i < candidates.length; i++) {
+      try {
+        resp = await this.api.orders.create({ ...base, price: candidates[i] });
+        this._priceFormatIdx = i === 0 && this._priceFormatIdx !== undefined ? this._priceFormatIdx : i;
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        if (err?.status !== 400) throw err;
+        console.warn(`[polymarket-us] order rejected with price format ${JSON.stringify(candidates[i])}: ${err.message}${i < candidates.length - 1 ? " - retrying with next format" : ""}`);
+      }
+    }
+    if (lastErr) throw lastErr;
+
+    // The response may be enveloped like everything else.
+    const orderId = resp?.id ?? resp?.order?.id ?? resp?.orderId ?? resp?.order_id ?? resp?.data?.id;
+    if (!orderId) {
+      throw new Error(`Exchange responded but returned no order id - the order may NOT be live. Raw response: ${JSON.stringify(resp).slice(0, 300)}`);
+    }
+    this.orderMarketSlugs.set(orderId, tokenId);
+
+    // Verify the order actually rests (or filled) - never claim success blind.
+    let verified = false;
+    try {
+      const check = await this.api.orders.retrieve(orderId);
+      const o = check?.order || check;
+      const state = String(o?.state || "");
+      if (state.includes("REJECT")) {
+        throw new Error(`Exchange REJECTED the order: ${o.orderRejectReason || state}`);
+      }
+      verified = !!o?.id;
+    } catch (err) {
+      if (String(err.message).includes("REJECTED")) throw err;
+      // retrieval hiccup only - reconcile will confirm shortly
+    }
+    return { success: true, orderID: orderId, intent, verified };
   }
 
   async cancelOrder(orderId) {
@@ -386,7 +437,8 @@ export class PolymarketUSClient {
   async getOpenOrders() {
     this._assertTradable();
     const res = await this.api.orders.list();
-    return (res.orders || []).map((o) => {
+    const orders = res?.orders || res?.openOrders || res?.data?.orders || (Array.isArray(res) ? res : []);
+    return orders.map((o) => {
       this.orderMarketSlugs.set(o.id, o.marketSlug);
       const intent = o.intent || "";
       const sell = intent.includes("SELL") || o.side === "ORDER_SIDE_SELL";
@@ -416,7 +468,7 @@ export class PolymarketUSClient {
       if (err?.status === 404) return null; // gone
       throw err; // transient - caller decides
     }
-    const o = res?.order;
+    const o = res?.order || (res?.id ? res : null) || res?.data?.order;
     if (!o) return null;
     const LIVE_STATES = new Set([
       "ORDER_STATE_NEW", "ORDER_STATE_PENDING_NEW", "ORDER_STATE_PARTIALLY_FILLED",
@@ -433,15 +485,17 @@ export class PolymarketUSClient {
   async getBalance() {
     this._assertTradable();
     const res = await this.api.account.balances();
-    const b = res?.balances?.[0];
-    return b ? { usd: b.currentBalance, buyingPower: b.buyingPower } : { usd: null };
+    const list = res?.balances || res?.data?.balances || (Array.isArray(res) ? res : []);
+    const b = list[0];
+    return b ? { usd: b.currentBalance ?? b.current_balance, buyingPower: b.buyingPower ?? b.buying_power } : { usd: null };
   }
 
   async getPositions() {
     this._assertTradable();
     const res = await this.api.portfolio.positions();
+    const positions = res?.positions || res?.data?.positions || {};
     const out = [];
-    for (const [slug, p] of Object.entries(res?.positions || {})) {
+    for (const [slug, p] of Object.entries(positions)) {
       out.push({
         market: p.marketMetadata?.title || slug,
         outcome: p.marketMetadata?.outcome || "",
@@ -615,9 +669,27 @@ export class PolymarketUSClient {
     if (!this.readonly) {
       await step("auth check: account.balances()", () => this.api.account.balances());
       await step("auth check: orders.list()", () => this.api.orders.list());
+      // Order-placement test via the preview endpoint: validates the exact
+      // request shape server-side WITHOUT placing anything or spending money.
+      const slug = out.candidateSlugs[0];
+      if (slug) {
+        for (const px of priceCandidates(0.02, this.priceScale)) {
+          const r = await step(`orders.preview (1 contract @ 2c, price=${JSON.stringify(px)}) [no money moves]`, () =>
+            this.api.orders.preview({
+              request: {
+                marketSlug: slug, intent: "ORDER_INTENT_BUY_LONG", type: "ORDER_TYPE_LIMIT",
+                price: px, quantity: 1, tif: "TIME_IN_FORCE_GOOD_TILL_CANCEL",
+              },
+            }));
+          if (r) break; // first accepted format is enough
+        }
+      }
     } else {
       out.steps.push({ name: "auth check", ok: false, error: "skipped - no API keys configured" });
     }
+    out.dryRun = config.dryRun
+      ? "DRY_RUN IS ON - all orders are simulated. Set DRY_RUN=false in the hosting variables to trade for real."
+      : false;
 
     // Websocket probe: the live feed is a separate data source from the REST
     // book/bbo endpoints - it can carry quotes even when those come back empty.
