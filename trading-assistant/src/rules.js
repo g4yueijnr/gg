@@ -234,6 +234,9 @@ export class RulesEngine {
 
     const tickSize = await this.pm.getTickSize(tokenId);
     const book = await this.pm.getOrderBook(tokenId);
+    // Pin the rule to whichever market id the book actually answered under,
+    // so the live feed, polling, and orders all speak the same name.
+    if (book.tokenId && book.tokenId !== tokenId) tokenId = book.tokenId;
     // View the book from the side we're bidding on (NO bid = mirror of YES ask).
     const view = sideView(outcomeSide, book.bestBid, book.bestAsk);
 

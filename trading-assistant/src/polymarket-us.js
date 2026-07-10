@@ -7,25 +7,47 @@ import { config } from "./config.js";
  * their payload, e.g. {market: {...}}, {order: {...}}). Accept every plausible
  * shape so a wrapper or renamed field can never read as an "empty book" again.
  */
+/** Levels may arrive as an array of {px,qty} or as a {price: qty} map. */
+function normLevels(x) {
+  if (Array.isArray(x)) return x;
+  if (x && typeof x === "object") {
+    return Object.entries(x).map(([px, qty]) => ({ px, qty }));
+  }
+  return [];
+}
+
 function unwrapBook(raw) {
-  const b = raw?.book || raw?.marketBook || raw?.market_book || raw?.data || raw || {};
-  return {
-    bids: b.bids || b.buys || [],
-    asks: b.offers || b.asks || b.sells || [],
-    stats: b.stats,
-    state: b.state,
-  };
+  // Scan candidates and take the first that actually CONTAINS a book -
+  // never let an unrelated field (e.g. a "data" timestamp blob) shadow it.
+  const candidates = [raw?.book, raw?.marketBook, raw?.market_book, raw?.data, raw];
+  for (const c of candidates) {
+    if (!c || typeof c !== "object") continue;
+    const bids = normLevels(c.bids ?? c.buys);
+    const asks = normLevels(c.offers ?? c.asks ?? c.sells);
+    if (bids.length || asks.length) {
+      return { bids, asks, stats: c.stats, state: c.state };
+    }
+  }
+  const base = raw?.book || raw?.marketBook || raw?.data || raw || {};
+  return { bids: [], asks: [], stats: base.stats, state: base.state };
 }
 
 function unwrapBbo(raw) {
-  const b = raw?.bbo || raw?.marketBbo || raw?.market_bbo || raw?.data || raw || {};
-  return {
-    bestBid: b.bestBid ?? b.best_bid ?? b.bid,
-    bestAsk: b.bestAsk ?? b.best_ask ?? b.ask ?? b.offer,
-    bidDepth: b.bidDepth ?? b.bid_depth,
-    askDepth: b.askDepth ?? b.ask_depth,
-    lastTradePx: b.lastTradePx ?? b.last_trade_px ?? b.lastTradePrice,
-  };
+  const candidates = [raw?.bbo, raw?.marketBbo, raw?.market_bbo, raw?.data, raw];
+  for (const c of candidates) {
+    if (!c || typeof c !== "object") continue;
+    const bestBid = c.bestBid ?? c.best_bid ?? c.bid;
+    const bestAsk = c.bestAsk ?? c.best_ask ?? c.ask ?? c.offer;
+    if (bestBid !== undefined || bestAsk !== undefined) {
+      return {
+        bestBid, bestAsk,
+        bidDepth: c.bidDepth ?? c.bid_depth,
+        askDepth: c.askDepth ?? c.ask_depth,
+        lastTradePx: c.lastTradePx ?? c.last_trade_px ?? c.lastTradePrice,
+      };
+    }
+  }
+  return {};
 }
 
 function levelPrice(l) { return l.px ?? l.price ?? l.p; }
@@ -69,6 +91,10 @@ export class PolymarketUSClient {
     this.orderMarketSlugs = new Map(); // orderId -> marketSlug (cancel needs both)
     this._slugOk = new Set();          // slugs confirmed tradable
     this._slugAlias = new Map();       // short/stale slug -> canonical tradable slug
+    // Known slug prefixes (the quote services serve markets under prefixed
+    // names like "astatc-<slug>"). Seeded from live observations; new ones
+    // are learned automatically whenever a short/long pair is discovered.
+    this._knownPrefixes = new Set(["astatc"]);
 
     this.ws = null;
     this.wsWanted = new Set();
@@ -141,6 +167,17 @@ export class PolymarketUSClient {
    * while search/event payloads sometimes hand out shortened variants that
    * 404 everywhere. Verify once, repair if needed, cache the answer.
    */
+  _learnPrefixPair(shortSlug, longSlug) {
+    if (!shortSlug || !longSlug || shortSlug === longSlug) return;
+    if (longSlug.endsWith(`-${shortSlug}`)) {
+      const prefix = longSlug.slice(0, longSlug.length - shortSlug.length - 1);
+      if (prefix && prefix.length <= 24 && !this._knownPrefixes.has(prefix)) {
+        this._knownPrefixes.add(prefix);
+        console.log(`[polymarket-us] learned market id prefix "${prefix}-"`);
+      }
+    }
+  }
+
   async canonicalTokenId(slug) {
     if (!slug) return slug;
     if (this._slugOk.has(slug)) return slug;
@@ -148,22 +185,38 @@ export class PolymarketUSClient {
     try {
       const r = await this.api.markets.retrieveBySlug(slug);
       const real = (r?.market || r)?.slug || slug;
-      this._slugOk.add(real);
+      // NB: the market-lookup service can accept names the quote services
+      // don't - so this does NOT prove the id yields data. getOrderBook /
+      // quote attachment confirm that and rescue via name variants.
       if (real !== slug) this._slugAlias.set(slug, real);
+      this._learnPrefixPair(slug.length < real.length ? slug : real, slug.length < real.length ? real : slug);
       return real;
     } catch (err) {
       if (err?.status !== 404) return slug; // transient - use as-is, retry later
     }
-    // 404: hunt for the market whose canonical slug contains/ends with ours.
+    // 404: try known prefix variants directly (deterministic, no search).
+    for (const alt of this._altSlugs(slug)) {
+      try {
+        const r = await this.api.markets.retrieveBySlug(alt);
+        const real = (r?.market || r)?.slug || alt;
+        this._slugAlias.set(slug, real);
+        this._learnPrefixPair(slug.length < real.length ? slug : real, slug.length < real.length ? real : slug);
+        console.log(`[polymarket-us] resolved market id "${slug}" -> "${real}" (prefix variant)`);
+        return real;
+      } catch (err) {
+        if (err?.status !== 404) break;
+      }
+    }
+    // Last resort: hunt via search for a slug that contains/ends with ours.
     try {
       const res = await this.api.search.query({ query: slug.replace(/-/g, " "), limit: 5 });
       for (const ev of res?.events || []) {
         for (const mk of ev.markets || []) {
           if (!mk.slug) continue;
           if (mk.slug === slug || mk.slug.endsWith(`-${slug}`) || mk.slug.endsWith(slug) || slug.endsWith(mk.slug)) {
-            this._slugOk.add(mk.slug);
             this._slugAlias.set(slug, mk.slug);
-            console.log(`[polymarket-us] resolved market id "${slug}" -> "${mk.slug}"`);
+            this._learnPrefixPair(slug.length < mk.slug.length ? slug : mk.slug, slug.length < mk.slug.length ? mk.slug : slug);
+            console.log(`[polymarket-us] resolved market id "${slug}" -> "${mk.slug}" (search)`);
             return mk.slug;
           }
         }
@@ -231,36 +284,37 @@ export class PolymarketUSClient {
     for (const o of all.slice(24)) {
       o.quotes = "NOT FETCHED - call get_order_book on this tokenId for live prices";
     }
+    const quoteOne = async (o, slug) => {
+      const bbo = unwrapBbo(await this.api.markets.bbo(slug));
+      const bestBid = this._toDollars(bbo.bestBid);
+      const bestAsk = this._toDollars(bbo.bestAsk);
+      if (bestBid === null && bestAsk === null) return false;
+      o.tokenId = slug;
+      o.bestBid = bestBid;
+      o.bestAsk = bestAsk;
+      o.lastPrice = this._toDollars(bbo.lastTradePx);
+      delete o.quotes;
+      this._slugOk.add(slug); // quotes answered -> id is right
+      return true;
+    };
     await Promise.all(outcomes.map(async (o) => {
-      try {
-        const bbo = unwrapBbo(await this.api.markets.bbo(o.tokenId));
-        o.bestBid = this._toDollars(bbo.bestBid);
-        o.bestAsk = this._toDollars(bbo.bestAsk);
-        o.lastPrice = this._toDollars(bbo.lastTradePx);
-        if (o.bestBid === null && o.bestAsk === null) {
-          o.quotes = "quote endpoint returned nothing - call get_order_book before concluding anything about liquidity";
-        }
-        this._slugOk.add(o.tokenId); // quotes answered -> slug is tradable
-      } catch (err) {
-        // A 404 here means this outcome's slug is a shortened variant -
-        // repair it in place so the assistant only ever sees good ids.
-        if (err?.status === 404) {
-          const fixed = await this.canonicalTokenId(o.tokenId);
-          if (fixed !== o.tokenId) {
-            o.tokenId = fixed;
-            try {
-              const bbo = unwrapBbo(await this.api.markets.bbo(fixed));
-              o.bestBid = this._toDollars(bbo.bestBid);
-              o.bestAsk = this._toDollars(bbo.bestAsk);
-              o.lastPrice = this._toDollars(bbo.lastTradePx);
-            } catch {
-              o.quotes = "quote fetch failed - call get_order_book on this tokenId for live prices";
+      const original = o.tokenId;
+      // Try the given id, then every known name variant; adopt whichever the
+      // quote service actually answers under, so the assistant only ever sees
+      // ids that produce live data.
+      const tries = [original, this._slugAlias.get(original), ...this._altSlugs(original)].filter(Boolean);
+      for (const slug of tries) {
+        try {
+          if (await quoteOne(o, slug)) {
+            if (slug !== original) {
+              this._slugAlias.set(original, slug);
+              this._learnPrefixPair(original.length < slug.length ? original : slug, original.length < slug.length ? slug : original);
             }
+            return;
           }
-        } else {
-          o.quotes = "quote fetch failed - call get_order_book on this tokenId for live prices";
-        }
+        } catch { /* next variant */ }
       }
+      o.quotes = "no quotes under any known id - call get_order_book on this tokenId before concluding anything about liquidity";
     }));
   }
 
@@ -315,29 +369,28 @@ export class PolymarketUSClient {
 
   // ---------- order book / prices ----------
 
-  async getOrderBook(slug, _retried = false) {
-    // Resolve shortened/stale market ids to the canonical tradable slug first.
-    if (!this._slugOk.has(slug)) {
-      const fixed = await this.canonicalTokenId(slug);
-      if (fixed !== slug) slug = fixed;
+  /** Name variants the exchange's quote services might use for this market. */
+  _altSlugs(slug) {
+    const out = new Set();
+    for (const p of this._knownPrefixes || []) {
+      if (slug.startsWith(`${p}-`)) out.add(slug.slice(p.length + 1));
+      else out.add(`${p}-${slug}`);
     }
-    // Primary: full depth from the book endpoint (normalized across the
-    // envelope/field-name variants the exchange may use).
+    out.delete(slug);
+    return [...out];
+  }
+
+  /** Book -> BBO read pipeline for one slug. Returns a summary or null if no data. */
+  async _readBook(slug) {
     let book = null;
-    let bookErr = null;
     try {
       book = unwrapBook(await this.api.markets.book(slug));
-    } catch (err) {
-      bookErr = err;
-    }
+    } catch { /* try bbo */ }
     if (book && (book.bids.length || book.asks.length)) {
       const s = this._summarizeBook(slug, book.bids, book.asks, book.stats?.lastTradePx);
       s.state = book.state;
       return s;
     }
-
-    // Fallback: best bid/offer endpoint (some deployments serve quotes here even
-    // when the depth endpoint comes back empty).
     try {
       const bbo = unwrapBbo(await this.api.markets.bbo(slug));
       const bestBid = this._toDollars(bbo.bestBid);
@@ -358,13 +411,41 @@ export class PolymarketUSClient {
         this.lastBookAt.set(slug, Date.now());
         return summary;
       }
-    } catch { /* fall through to diagnosis */ }
+    } catch { /* no data under this slug */ }
+    return null;
+  }
+
+  async getOrderBook(slug) {
+    // Resolve shortened/stale market ids to the canonical tradable slug first.
+    if (!this._slugOk.has(slug)) {
+      const fixed = await this.canonicalTokenId(slug);
+      if (fixed !== slug) slug = fixed;
+    }
+    let summary = await this._readBook(slug);
+    if (summary) {
+      this._slugOk.add(slug); // quotes answered - THIS is proof the id is right
+      return summary;
+    }
+
+    // No data under this name. The market-lookup service can accept a name the
+    // quote services don't - so hunt across known name variants and adopt
+    // whichever one the book actually answers under.
+    for (const alt of this._altSlugs(slug)) {
+      summary = await this._readBook(alt);
+      if (summary) {
+        this._slugAlias.set(slug, alt);
+        this._slugOk.add(alt);
+        this._learnPrefixPair(slug.length < alt.length ? slug : alt, slug.length < alt.length ? alt : slug);
+        console.log(`[polymarket-us] book data found under "${alt}" (was asked for "${slug}")`);
+        return summary;
+      }
+    }
 
     // Still nothing: figure out WHY so the assistant can say something useful
     // instead of pretending the market is empty.
-    console.warn(`[polymarket-us] empty book for "${slug}"; raw book=${JSON.stringify(book || null).slice(0, 300)}${bookErr ? ` err=${bookErr.message}` : ""}`);
+    console.warn(`[polymarket-us] empty book for "${slug}" (and ${this._altSlugs(slug).length} variant(s))`);
     let title = null;
-    let state = book?.state;
+    let state;
     try {
       const r = await this.api.markets.retrieveBySlug(slug);
       title = r?.market?.title;
