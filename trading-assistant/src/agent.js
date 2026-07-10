@@ -19,6 +19,9 @@ How to behave:
 - "Outbid up to X" instructions are standing rules -> use create_auto_outbid_rule, not a one-off order.
 - "One cent above the current highest bid" style instructions: omit startPrice on create_auto_outbid_rule - the engine reads the live book and starts one tick above the best bid at placement time. Don't read the book yourself and hardcode a price for this; the omitted-startPrice path is more accurate.
 - Budget instructions ("1000 contracts at 5c, bid up to 30c, but never spend more than $150"): one rule with size=1000, startPrice=0.05, maxPrice=0.30, maxCostUsd=150. The engine shrinks the size automatically as the price climbs so spend never exceeds the budget - don't create multiple rules or do the size math yourself.
+- Sell-after-fill ("when it fills, sell at 50c" / "flip fills immediately"): set onFill on the same rule - {mode:"limit", price:0.50} or {mode:"immediate"}. The engine reacts to fills in real time via the exchange's private stream, per partial fill, with no AI in the loop.
+- "Stop everything" / "cancel all" -> emergency_stop. Confirm what was cancelled from the tool result.
+- After creating a rule, confirm it as a compact structured summary: market/outcome, starting bid, outbid rule, cap, size, budget, exit-on-fill, auto-cancel time, and status (say SIMULATED instead of LIVE when dry-run is on).
 - Cancel conditions ("cancel it Friday night", "pull it after 24 hours"): compute an ISO UTC datetime from the current time in <context> and pass it as expiresAt. Confirm the exact time back to the user in their terms.
 - After placing orders or creating rules, state exactly what is now resting: market, outcome, price, size, cap, and expiry if any.
 - Report failures honestly and suggest the fix (e.g. insufficient balance, price would cross the spread).
@@ -103,6 +106,15 @@ function toolDefs() {
           maxPrice: { type: "number", description: "Hard cap in dollars per share (0.60 = 60c)" },
           outcomeSide: { type: "string", enum: ["YES", "NO"], description: "Polymarket US only: bid on YES (default) or NO. For NO, all prices are NO prices and the engine outbids competing NO bidders. On Polymarket global, use the No outcome's own tokenId instead." },
           maxCostUsd: { type: "number", description: "Optional total dollar budget for the rule. As the price rises, the engine automatically shrinks the order size so price x size never exceeds this (e.g. size 1000 with $150 budget: 1000 contracts at 5c, ~500 at 30c). Use when the user says 'don't spend more than $X'." },
+          onFill: {
+            type: "object",
+            description: "Optional sell-after-fill: what the engine does the moment contracts fill (works per partial fill, in real time). {mode:'limit', price:0.50} rests a sell at 50c for each fill; {mode:'immediate'} sells each fill into the live best bid instantly. Omit for no automatic exit.",
+            properties: {
+              mode: { type: "string", enum: ["limit", "immediate"] },
+              price: { type: "number", description: "Required for mode=limit: exit price in dollars per share" },
+            },
+            required: ["mode"],
+          },
           expiresAt: { type: "string", description: "Optional ISO 8601 UTC datetime when the rule should auto-cancel itself and pull the order, e.g. 2026-07-12T21:00:00Z. Compute it from the current time in <context> when the user says things like 'cancel it Friday' or 'kill it after 24 hours'." },
           marketQuestion: { type: "string", description: "The market question, for display" },
           outcome: { type: "string", description: "Outcome name, e.g. Yes/No" },
@@ -136,6 +148,11 @@ function toolDefs() {
     {
       name: "list_rules",
       description: "List all standing rules (active and past) with their status.",
+      input_schema: { type: "object", properties: {} },
+    },
+    {
+      name: "emergency_stop",
+      description: "EMERGENCY STOP: cancels every standing rule AND every open order on the account, immediately. Use when the user says 'stop everything', 'cancel all', 'emergency stop', 'get me out'.",
       input_schema: { type: "object", properties: {} },
     },
     {
@@ -205,6 +222,7 @@ export class Agent {
       case "cancel_rule": return this.rules.cancelRule(input.ruleId);
       case "list_rules": return this.rules.listRules();
       case "diagnose_market": return this.pm.diagnose(input.query);
+      case "emergency_stop": return this.rules.emergencyStop();
       case "set_trading_mode": {
         config.dryRun = !input.live;
         this.store.state.settings.dryRun = !input.live;

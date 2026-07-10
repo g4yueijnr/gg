@@ -17,21 +17,165 @@ export class RulesEngine {
     this._locks = new Map();   // ruleId -> promise chain (serialize actions per rule)
     this._lastAction = new Map(); // ruleId -> ts of last repost (throttle)
     this._reconcileTimer = null;
+    this._expiryTimers = new Map(); // ruleId -> timer for precise timed cancels
   }
 
   start() {
     this.pm.onBookUpdate((summary) => this._onBook(summary));
+    // Real-time fills/cancels/rejects from the exchange's private stream -
+    // the primary fill path; reconcile below is the safety net.
+    this.pm.onOrderEvent?.((evt) => this._onOrderEvent(evt));
+    this.pm.startPrivateFeed?.();
+
     for (const rule of this.activeRules()) {
       this.pm.watchToken(rule.tokenId);
+      this._armExpiry(rule);
+      // Repair any rule pinned to a stale market id from an older version.
+      if (this.pm.canonicalTokenId) {
+        this.pm.canonicalTokenId(rule.tokenId).then((fixed) => {
+          if (fixed !== rule.tokenId) {
+            this.pm.unwatchToken?.(rule.tokenId);
+            rule.tokenId = fixed;
+            this.store.save();
+            this.pm.watchToken(fixed);
+          }
+        }).catch(() => {});
+      }
     }
     this._reconcileTimer = setInterval(() => {
       this._reconcile().catch((err) => console.error("[rules] reconcile error:", err.message));
     }, config.reconcileIntervalMs);
+    // Startup reconciliation: verify tracked orders against the exchange now
+    // and surface any orphaned exchange orders no rule knows about.
+    setTimeout(() => {
+      this._reconcile().catch(() => {});
+      this._detectOrphans().catch(() => {});
+    }, 1500);
     console.log(`[rules] engine started with ${this.activeRules().length} active rule(s)`);
   }
 
   stop() {
     clearInterval(this._reconcileTimer);
+    for (const t of this._expiryTimers.values()) clearTimeout(t);
+    this._expiryTimers.clear();
+  }
+
+  /** Emergency stop: cancel every rule and every open order on the account. */
+  async emergencyStop() {
+    const stopped = [];
+    for (const rule of this.store.state.rules) {
+      if (rule.status === "active" || rule.status === "capped") {
+        rule.status = "cancelled";
+        rule.updatedAt = new Date().toISOString();
+        stopped.push(rule.id);
+        clearTimeout(this._expiryTimers.get(rule.id));
+      }
+    }
+    this.store.save();
+    let cancelled = { canceledOrderIds: [] };
+    try {
+      cancelled = await this.pm.cancelAllOrders();
+    } catch (err) {
+      this.store.addActivity("system", `EMERGENCY STOP: rules stopped but cancel-all FAILED: ${err.message}. Check open orders manually!`, { level: "warn" });
+      throw err;
+    }
+    const entry = this.store.addActivity("system",
+      `EMERGENCY STOP: ${stopped.length} rule(s) stopped, ${(cancelled.canceledOrderIds || []).length} open order(s) cancelled.`, { level: "warn" });
+    this.notify(entry);
+    return { rulesStopped: stopped, ordersCancelled: cancelled.canceledOrderIds || [] };
+  }
+
+  /** Surface exchange orders that no rule is tracking (placed manually or lost). */
+  async _detectOrphans() {
+    if (this.pm.readonly) return;
+    let open;
+    try { open = await this.pm.getOpenOrders(); } catch { return; }
+    const tracked = new Set(this.store.state.rules.map((r) => r.orderId).filter(Boolean));
+    for (const o of open) {
+      if (!tracked.has(o.orderId)) {
+        this.store.addActivity("system",
+          `Found an open order no rule is managing: ${o.side} ${o.size} @ ${fmt(o.price)} on "${o.market}" (${String(o.orderId).slice(0, 12)}...). ` +
+          `It rests untouched - ask the assistant to cancel it if unwanted.`, { level: "warn" });
+      }
+    }
+  }
+
+  /** Precise timed cancels: an in-process timer fires within ~1s of expiresAt. */
+  _armExpiry(rule) {
+    clearTimeout(this._expiryTimers.get(rule.id));
+    this._expiryTimers.delete(rule.id);
+    if (!rule.expiresAt || rule.status !== "active") return;
+    const ms = Date.parse(rule.expiresAt) - Date.now();
+    if (ms > 2 ** 31 - 1000) return; // >24 days out: reconcile fallback covers it
+    const t = setTimeout(() => {
+      this._enqueue(rule.id, () => this._expireIfDue(rule));
+    }, Math.max(ms, 0));
+    if (t.unref) t.unref();
+    this._expiryTimers.set(rule.id, t);
+  }
+
+  /**
+   * Real-time order event from the exchange's private stream. Applies fill
+   * progress instantly (and fires sell-after-fill exits) instead of waiting
+   * for the reconcile cycle.
+   */
+  _onOrderEvent(evt) {
+    const rule = this.store.state.rules.find((r) => r.orderId === evt.orderId);
+    if (!rule) return;
+    this._enqueue(rule.id, async () => {
+      if (rule.status !== "active" && rule.status !== "capped") return;
+      if (evt.rejectReason || String(evt.state).includes("REJECT")) {
+        this._log(rule, `Exchange REJECTED my order: ${evt.rejectReason || evt.state}. Rule paused.`, "warn");
+        rule.status = "error";
+        this.store.save();
+        return;
+      }
+      await this._applyFillProgress(rule, evt.cumQuantity);
+      // Fully filled? Kick the completion logic (rest next slice / finish rule) now.
+      if (String(evt.state).includes("FILLED") && !String(evt.state).includes("PARTIALLY")) {
+        setTimeout(() => this._reconcile().catch(() => {}), 300);
+      }
+    });
+  }
+
+  /** Idempotent fill accounting shared by the private stream and reconcile. */
+  async _applyFillProgress(rule, cumQuantity) {
+    const seen = rule.orderFilledSeen || 0;
+    if (!(cumQuantity > seen)) return;
+    const newlyFilled = cumQuantity - seen;
+    rule.orderFilledSeen = cumQuantity;
+    rule.filledSize = (rule.filledSize || 0) + newlyFilled;
+    rule.spentUsd = round2((rule.spentUsd || 0) + newlyFilled * (rule.myPrice || 0));
+    this.store.save();
+    this._log(rule, `FILL: ${newlyFilled} shares at ${fmt(rule.myPrice)} (${rule.filledSize}/${rule.size} total` +
+      `${rule.maxCostUsd ? `, $${rule.spentUsd} of $${rule.maxCostUsd} budget` : ""}).`, "success");
+    await this._maybeExit(rule, newlyFilled);
+  }
+
+  /** Sell-after-fill: place the configured exit for freshly filled contracts. */
+  async _maybeExit(rule, qty) {
+    const exit = rule.onFill;
+    if (!exit || exit.mode === "none" || qty < 1) return;
+    let price = exit.price;
+    if (exit.mode === "immediate" || price === undefined || price === null) {
+      // Marketable limit: sell into the current best bid on our side of the book.
+      const book = this.pm.books.get(rule.tokenId);
+      const view = sideView(rule.outcomeSide, book?.bestBid ?? null, book?.bestAsk ?? null);
+      price = view.bid;
+      if (price === null || price === undefined) {
+        // No live bid to hit - rest at our entry price so nothing dumps blindly.
+        price = rule.myPrice;
+        this._log(rule, `Exit: no live bid to sell ${qty} into - resting a sell at my entry ${fmt(price)} instead.`, "warn");
+      }
+    }
+    try {
+      const resp = await this.pm.placeOrder({
+        tokenId: rule.tokenId, side: "SELL", price, size: qty, outcomeSide: rule.outcomeSide,
+      });
+      this._log(rule, `EXIT placed: selling ${qty} at ${fmt(price)} (order ${String(resp.orderID).slice(0, 12)}...).`, "success");
+    } catch (err) {
+      this._log(rule, `EXIT FAILED for ${qty} filled shares: ${err.message}. Position remains open - tell me how to handle it.`, "warn");
+    }
   }
 
   activeRules() {
@@ -51,7 +195,16 @@ export class RulesEngine {
    * startPrice may be omitted -> start one tick above the current best bid.
    * expiresAt (ISO datetime) may be set -> rule auto-cancels at that time.
    */
-  async createAutoOutbid({ tokenId, size, startPrice, maxPrice, marketQuestion, outcome, conditionId, expiresAt, outcomeSide, maxCostUsd }) {
+  async createAutoOutbid({ tokenId, size, startPrice, maxPrice, marketQuestion, outcome, conditionId, expiresAt, outcomeSide, maxCostUsd, onFill }) {
+    // onFill: what to do when contracts fill. {mode:"none"} (default),
+    // {mode:"limit", price} (rest a sell at price), or {mode:"immediate"}
+    // (marketable sell into the live best bid, per fill).
+    if (onFill && onFill.mode && !["none", "limit", "immediate"].includes(onFill.mode)) {
+      throw new Error(`Unknown onFill mode "${onFill.mode}" - use none, limit, or immediate.`);
+    }
+    if (onFill?.mode === "limit" && !(onFill.price > 0 && onFill.price < 1)) {
+      throw new Error("onFill.price must be between 0 and 1 (dollars per share) for limit exits.");
+    }
     outcomeSide = String(outcomeSide || "YES").toUpperCase() === "NO" ? "NO" : "YES";
     if (outcomeSide === "NO" && this.pm.platform !== "us") {
       throw new Error("On Polymarket global, bid on the No outcome by using its own tokenId - don't pass outcomeSide.");
@@ -121,6 +274,7 @@ export class RulesEngine {
       startPrice: target,
       maxPrice,
       maxCostUsd: maxCostUsd || null,
+      onFill: onFill && onFill.mode !== "none" ? onFill : null,
       spentUsd: 0,
       expiresAt: expiryTs ? new Date(expiryTs).toISOString() : null,
       tickSize,
@@ -153,9 +307,11 @@ export class RulesEngine {
     this.store.save();
 
     this.pm.watchToken(tokenId);
+    this._armExpiry(rule);
     this._log(rule,
       `Rule created: bidding ${fmt(target)} for ${initialSize} ${outcomeSide === "NO" ? "NO " : ""}shares of "${rule.outcome}" - will auto-outbid up to ${fmt(maxPrice)}` +
       `${rule.maxCostUsd ? `, budget $${rule.maxCostUsd} (size shrinks as price rises)` : ""}` +
+      `${rule.onFill ? `, fills auto-sell ${rule.onFill.mode === "limit" ? `at ${fmt(rule.onFill.price)}` : "immediately (marketable)"}` : ""}` +
       `${rule.expiresAt ? `, auto-cancels ${new Date(rule.expiresAt).toUTCString()}` : ""}.`);
     return rule;
   }
@@ -171,6 +327,7 @@ export class RulesEngine {
       }
       rule.status = "cancelled";
       rule.updatedAt = new Date().toISOString();
+      clearTimeout(this._expiryTimers.get(rule.id));
       this.store.save();
       this._log(rule, `Rule cancelled (${reason}). Resting order removed.`);
     }
@@ -201,6 +358,7 @@ export class RulesEngine {
     if (size !== undefined) rule.size = size;
     rule.updatedAt = new Date().toISOString();
     this.store.save();
+    this._armExpiry(rule);
     this._log(rule, `Rule updated: max price now ${fmt(rule.maxPrice)}, size ${rule.size}.`);
     // Re-evaluate immediately against the latest known book
     const book = this.pm.books.get(rule.tokenId);
@@ -369,6 +527,7 @@ export class RulesEngine {
         rule.spentUsd = round2((rule.spentUsd || 0) + newlyFilled * (price || 0));
         this.store.save();
         this._log(rule, `${newlyFilled} shares had filled at ${fmt(price)} before the re-bid (${rule.filledSize}/${rule.size} total).`);
+        await this._maybeExit(rule, newlyFilled);
       }
     } catch { /* reconcile safety net will catch it */ }
   }
@@ -424,15 +583,7 @@ export class RulesEngine {
     for (const rule of active) {
       const o = openById.get(rule.orderId);
       if (o) {
-        if (o.filled > (rule.orderFilledSeen || 0)) {
-          const newlyFilled = o.filled - (rule.orderFilledSeen || 0);
-          rule.orderFilledSeen = o.filled;
-          rule.filledSize = (rule.filledSize || 0) + newlyFilled;
-          rule.spentUsd = round2((rule.spentUsd || 0) + newlyFilled * (rule.myPrice || 0));
-          this.store.save();
-          this._log(rule, `Partial fill: ${rule.filledSize}/${rule.size} shares bought (latest at ${fmt(rule.myPrice)})` +
-            `${rule.maxCostUsd ? ` ($${rule.spentUsd} of $${rule.maxCostUsd} budget used)` : ""}.`);
-        }
+        await this._applyFillProgress(rule, o.filled); // idempotent; exits fire inside
         continue;
       }
       // Order no longer open: either fully filled or cancelled externally.
@@ -443,11 +594,10 @@ export class RulesEngine {
         continue; // transient error - re-check next cycle
       }
       const matched = detail ? Number(detail.size_matched || 0) : null;
-      // Credit any fills of the vanished order that we hadn't counted yet.
-      if (matched !== null && matched > (rule.orderFilledSeen || 0)) {
-        const newlyFilled = matched - (rule.orderFilledSeen || 0);
-        rule.filledSize = (rule.filledSize || 0) + newlyFilled;
-        rule.spentUsd = round2((rule.spentUsd || 0) + newlyFilled * (rule.myPrice || 0));
+      // Credit any fills of the vanished order that we hadn't counted yet
+      // (idempotent; sell-after-fill exits fire inside).
+      if (matched !== null) {
+        await this._applyFillProgress(rule, matched);
       }
       const orderFullyFilled = matched !== null && matched >= (rule.mySize ?? rule.size) - 1e-9;
       const budgetLeft = rule.maxCostUsd ? rule.maxCostUsd - (rule.spentUsd || 0) : Infinity;

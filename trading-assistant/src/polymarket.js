@@ -384,6 +384,19 @@ export class Polymarket {
     try { this.ws?.close(); } catch { /* noop */ }
   }
 
+  // Interface parity with the US client (the global private feed is served by
+  // reconcile polling for now; listeners simply never fire).
+  onOrderEvent() { return () => {}; }
+  startPrivateFeed() { /* not implemented for global; reconcile covers fills */ }
+
+  /** Cancel every open order on the account (emergency stop). */
+  async cancelAllOrders() {
+    this._assertTradable();
+    if (config.dryRun) return { canceledOrderIds: [], dryRun: true };
+    const res = await this.client.cancelAll();
+    return { canceledOrderIds: res?.canceled || [] };
+  }
+
   /** Data-path diagnostic (global platform), runnable from the chat. */
   async diagnose(query) {
     const out = { platform: "global", query, steps: [] };

@@ -39,9 +39,10 @@ export const config = {
   maxOrderSizeShares: Number(process.env.MAX_ORDER_SIZE_SHARES || 10000),
   maxOrderCostUsd: Number(process.env.MAX_ORDER_COST_USD || 1000),
 
-  // Rules engine tuning
-  minRepostIntervalMs: Number(process.env.MIN_REPOST_INTERVAL_MS || 1200),
-  reconcileIntervalMs: Number(process.env.RECONCILE_INTERVAL_MS || 15000),
+  // Rules engine tuning. Reposts are throttled only enough to respect exchange
+  // rate limits; fills arrive via the private stream so reconcile is a backstop.
+  minRepostIntervalMs: Number(process.env.MIN_REPOST_INTERVAL_MS || 300),
+  reconcileIntervalMs: Number(process.env.RECONCILE_INTERVAL_MS || 10000),
 
   dryRun: bool(process.env.DRY_RUN, false),
 };

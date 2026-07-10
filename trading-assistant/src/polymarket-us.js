@@ -75,6 +75,13 @@ export class PolymarketUSClient {
     this.wsReconnectDelay = 1000;
     this._wsConnecting = false;
 
+    // Private (authenticated) stream: real-time order/fill events.
+    this.orderListeners = new Set(); // fn({orderId, marketSlug, state, cumQuantity, lastPx, execType})
+    this.pws = null;
+    this._pwsConnecting = false;
+    this._pwsReconnectDelay = 1000;
+    this._pwsWanted = false;
+
     // Poll backstop: guarantees book updates for watched markets even if the
     // websocket is down/silent. lastBookAt tracks freshness per market.
     this.lastBookAt = new Map();
@@ -641,6 +648,97 @@ export class PolymarketUSClient {
     if (this._pollTimer.unref) this._pollTimer.unref();
   }
 
+  // ---------- private order/fill stream (authenticated) ----------
+
+  onOrderEvent(fn) {
+    this.orderListeners.add(fn);
+    return () => this.orderListeners.delete(fn);
+  }
+
+  /** Start the authenticated stream that pushes order accepts/fills/cancels in real time. */
+  startPrivateFeed() {
+    if (this.readonly) return;
+    this._pwsWanted = true;
+    this._ensurePws();
+  }
+
+  _ensurePws() {
+    if (!this._pwsWanted || this.readonly) return;
+    if (this.pws && this.pws.isConnected) return;
+    if (this._pwsConnecting) return;
+    this._connectPws();
+  }
+
+  async _connectPws() {
+    this._pwsConnecting = true;
+    try {
+      const pws = this.api.ws.private();
+      this.pws = pws;
+      const handle = (execution) => {
+        // Envelope/field tolerance, like everything else on this exchange.
+        const ex = execution?.execution || execution || {};
+        const o = ex.order || ex;
+        const orderId = o?.id || ex.orderId;
+        if (!orderId) return;
+        const evt = {
+          orderId,
+          marketSlug: o?.marketSlug || o?.market_slug,
+          state: o?.state || ex.state || "",
+          cumQuantity: Number(o?.cumQuantity ?? o?.cum_quantity ?? 0),
+          quantity: Number(o?.quantity ?? 0),
+          lastPx: this._toDollars(ex.lastPx ?? ex.last_px),
+          execType: ex.type || "",
+          rejectReason: ex.orderRejectReason || o?.orderRejectReason,
+        };
+        for (const fn of this.orderListeners) {
+          try { fn(evt); } catch (err) { console.error("[polymarket-us] order listener error:", err); }
+        }
+      };
+      pws.on("orderUpdate", (msg) => handle(msg.orderSubscriptionUpdate || msg.order_subscription_update || msg));
+      pws.on("orderSnapshot", (msg) => {
+        const snap = msg.orderSubscriptionSnapshot || msg.order_subscription_snapshot || msg;
+        for (const o of snap?.orders || []) handle({ order: o, type: "SNAPSHOT" });
+      });
+      pws.on("error", (err) => console.warn("[polymarket-us] private feed error:", err.message));
+      pws.on("close", () => {
+        console.warn("[polymarket-us] private feed disconnected, reconnecting...");
+        const delay = this._pwsReconnectDelay;
+        this._pwsReconnectDelay = Math.min(this._pwsReconnectDelay * 2, 30000);
+        setTimeout(() => this._ensurePws(), delay);
+      });
+      await pws.connect();
+      this._pwsReconnectDelay = 1000;
+      pws.subscribeOrders(`orders-${Date.now()}`);
+      console.log("[polymarket-us] private order/fill feed connected");
+    } catch (err) {
+      console.warn("[polymarket-us] private feed connect failed:", err.message);
+      const delay = this._pwsReconnectDelay;
+      this._pwsReconnectDelay = Math.min(this._pwsReconnectDelay * 2, 30000);
+      setTimeout(() => this._ensurePws(), delay);
+    } finally {
+      this._pwsConnecting = false;
+    }
+  }
+
+  /** Cancel every open order on the account (emergency stop). */
+  async cancelAllOrders() {
+    this._assertTradable();
+    if (config.dryRun) return { canceledOrderIds: [], dryRun: true };
+    try {
+      const res = await this.api.orders.cancelAll({});
+      return { canceledOrderIds: res?.canceledOrderIds || res?.canceled_order_ids || [] };
+    } catch (err) {
+      // Endpoint hiccup: fall back to cancelling one by one.
+      const open = await this.getOpenOrders();
+      const done = [];
+      for (const o of open) {
+        try { await this.cancelOrder(o.orderId); done.push(o.orderId); } catch { /* keep going */ }
+      }
+      if (!done.length && open.length) throw err;
+      return { canceledOrderIds: done, note: `cancelAll endpoint failed (${err.message}); cancelled individually` };
+    }
+  }
+
   _ensureWs(resubscribe = false) {
     if (this.wsWanted.size === 0) return;
     if (this.ws && this.ws.isConnected) {
@@ -703,9 +801,11 @@ export class PolymarketUSClient {
 
   stop() {
     this.wsWanted.clear();
+    this._pwsWanted = false;
     clearInterval(this._pollTimer);
     this._pollTimer = null;
     try { this.ws?.close(); } catch { /* noop */ }
+    try { this.pws?.close(); } catch { /* noop */ }
   }
 
   /**
