@@ -217,13 +217,22 @@ export class PolymarketUSClient {
 
   /** Add live best bid/ask to search results so the assistant sees real prices immediately. */
   async _attachQuotes(results) {
-    const outcomes = results.flatMap((r) => r.outcomes).slice(0, 12);
+    const all = results.flatMap((r) => r.outcomes);
+    const outcomes = all.slice(0, 24);
+    // Outcomes we don't quote must say so explicitly - a missing quote field
+    // must never be readable as "no liquidity".
+    for (const o of all.slice(24)) {
+      o.quotes = "NOT FETCHED - call get_order_book on this tokenId for live prices";
+    }
     await Promise.all(outcomes.map(async (o) => {
       try {
         const bbo = unwrapBbo(await this.api.markets.bbo(o.tokenId));
         o.bestBid = this._toDollars(bbo.bestBid);
         o.bestAsk = this._toDollars(bbo.bestAsk);
         o.lastPrice = this._toDollars(bbo.lastTradePx);
+        if (o.bestBid === null && o.bestAsk === null) {
+          o.quotes = "quote endpoint returned nothing - call get_order_book before concluding anything about liquidity";
+        }
         this._slugOk.add(o.tokenId); // quotes answered -> slug is tradable
       } catch (err) {
         // A 404 here means this outcome's slug is a shortened variant -
@@ -237,8 +246,12 @@ export class PolymarketUSClient {
               o.bestBid = this._toDollars(bbo.bestBid);
               o.bestAsk = this._toDollars(bbo.bestAsk);
               o.lastPrice = this._toDollars(bbo.lastTradePx);
-            } catch { /* quote unavailable; id is still fixed */ }
+            } catch {
+              o.quotes = "quote fetch failed - call get_order_book on this tokenId for live prices";
+            }
           }
+        } else {
+          o.quotes = "quote fetch failed - call get_order_book on this tokenId for live prices";
         }
       }
     }));
