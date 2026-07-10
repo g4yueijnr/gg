@@ -835,6 +835,7 @@ export class PolymarketUSClient {
     try {
       const ws = this.api.ws.markets();
       this.ws = ws;
+      // Full-depth book stream.
       ws.on("marketData", (msg) => {
         const d = msg.marketData || msg.market_data || msg.data || msg;
         const slug = d?.marketSlug || d?.market_slug;
@@ -843,6 +844,29 @@ export class PolymarketUSClient {
         const summary = this._summarizeBook(slug, nb.bids, nb.asks, nb.stats?.lastTradePx);
         for (const fn of this.bookListeners) {
           try { fn(summary); } catch (err) { console.error("[polymarket-us] book listener error:", err); }
+        }
+      });
+      // Lightweight best-bid/ask stream - a second live source; on thin or
+      // fast markets it often updates when the full-depth stream is quiet.
+      ws.on("marketDataLite", (msg) => {
+        const d = msg.marketDataLite || msg.market_data_lite || msg;
+        const slug = d?.marketSlug || d?.market_slug;
+        if (!slug) return;
+        const bestBid = this._toDollars(d.bestBid ?? d.best_bid);
+        const bestAsk = this._toDollars(d.bestAsk ?? d.best_ask);
+        if (bestBid === null && bestAsk === null) return;
+        this.books.set(slug, { bestBid, bestAsk, ts: Date.now() });
+        this.lastBookAt.set(slug, Date.now());
+        const summary = {
+          tokenId: slug, bestBid, bestAsk,
+          noBestBid: bestAsk !== null ? Math.round((1 - bestAsk) * 1000) / 1000 : null,
+          noBestAsk: bestBid !== null ? Math.round((1 - bestBid) * 1000) / 1000 : null,
+          bids: bestBid !== null ? [{ price: bestBid, size: null }] : [],
+          asks: bestAsk !== null ? [{ price: bestAsk, size: null }] : [],
+          tickSize: 0.01, lite: true,
+        };
+        for (const fn of this.bookListeners) {
+          try { fn(summary); } catch (err) { console.error("[polymarket-us] lite listener error:", err); }
         }
       });
       ws.on("error", (err) => console.warn("[polymarket-us] market feed error:", err.message));
@@ -874,7 +898,10 @@ export class PolymarketUSClient {
         try { this.ws.unsubscribe(this._mdReqId); } catch { /* already gone */ }
       }
       this._mdReqId = `md-${Date.now()}`;
-      this.ws.subscribeMarketData(this._mdReqId, [...this.wsWanted]);
+      const assets = [...this.wsWanted];
+      this.ws.subscribeMarketData(this._mdReqId, assets);
+      // Also subscribe to the lite feed as a second live source.
+      try { this.ws.subscribeMarketDataLite?.(`mdl-${Date.now()}`, assets); } catch { /* optional */ }
     } catch (err) {
       console.warn("[polymarket-us] subscribe failed:", err.message);
     }
