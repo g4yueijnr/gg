@@ -16,6 +16,11 @@ async function main() {
   }
 
   const store = new Store(config.dataDir);
+  // A trading-mode choice made from the chat outlives restarts and beats the
+  // DRY_RUN env var, so going live never requires touching hosting variables.
+  if (typeof store.state.settings?.dryRun === "boolean") {
+    config.dryRun = store.state.settings.dryRun;
+  }
   // Polymarket US keys present -> US exchange; otherwise the global exchange.
   const useUS = !!(config.polymarketUsKeyId || config.polymarketUsSecret);
   const pm = useUS ? new PolymarketUSClient() : new Polymarket();

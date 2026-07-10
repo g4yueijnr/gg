@@ -14,6 +14,7 @@ export class Store {
       rules: [],        // standing instructions (auto-outbid etc.)
       messages: [],     // chat history (Anthropic message format)
       activity: [],     // human-readable activity log
+      settings: {},     // runtime overrides (e.g. dryRun toggled from chat)
       counters: { rule: 0 },
     };
     this._load();

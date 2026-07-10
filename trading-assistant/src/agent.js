@@ -24,6 +24,7 @@ How to behave:
 - Report failures honestly and suggest the fix (e.g. insufficient balance, price would cross the spread).
 - Order placement is verified: place_order returns verified:true only when the exchange confirmed the order is resting. If a result says dryRun/SIMULATED, the DRY_RUN setting is on - no real order was sent; tell the user to set DRY_RUN=false in their hosting variables to trade for real. If the user says an order "didn't go through", first check list_open_orders, then run diagnose_market (it now tests order placement via a no-money preview) and report the exact failing step.
 - HARD RULE on liquidity claims: NEVER say a market is empty, illiquid, or "hasn't built liquidity" unless you called get_order_book on that exact tokenId in THIS turn and it came back empty. Search results only carry quotes for some outcomes - an outcome with a "quotes" note or missing bestBid/bestAsk means the quotes were NOT fetched, not that the book is empty. Read the book first, then speak.
+- When the user names a market and wants info: search_markets to pin it down, then get_order_book, then give a tight live readout in one reply: best bid / best ask with sizes, top ~3 depth levels each side, the NO-side view (noBestBid/noBestAsk), and last trade. Fresh from the tools every time - never from memory.
 - Order books: results may include a "note" field explaining data quality (e.g. depth unavailable, market suspended). Relay it. If a book comes back empty but the user says they can see orders in the app, NEVER insist the book is empty - immediately run diagnose_market on it and report which step failed with the raw evidence. The background engine reads the same data you do, so a broken book means broken outbidding: treat it as urgent, don't shrug it off.
 - Empty book but the app shows a price? The app can display last-trade or indicative odds even when NO orders are resting. Ask the user to open the market's order book/depth view in the app and read you an actual bid - if there are no resting bids, the book really is empty and an auto-outbid rule needs an explicit starting price (there is nobody to outbid yet).
 - Prices: users often speak in cents ("10c", "ten cents") - convert to dollars per share (0.10). Shares are also called contracts.
@@ -138,6 +139,15 @@ function toolDefs() {
       input_schema: { type: "object", properties: {} },
     },
     {
+      name: "set_trading_mode",
+      description: "Switch between LIVE trading and DRY RUN (simulated orders). Overrides the DRY_RUN environment variable and persists across restarts. Use when the user says 'go live', 'turn off dry run', 'stop simulating' (live=true) or 'back to practice mode' (live=false). Confirm the new mode clearly - in live mode every order is real money.",
+      input_schema: {
+        type: "object",
+        properties: { live: { type: "boolean", description: "true = real orders, false = simulated" } },
+        required: ["live"],
+      },
+    },
+    {
       name: "diagnose_market",
       description: "Run a full data-path diagnostic against the exchange: connectivity, search, market lookup, order book, quotes, auth, and websocket state - with raw API responses. Use whenever market data looks wrong (empty books, missing markets, stale prices) or the user reports the bot 'can't see' something. Relay the failing step and raw evidence to the user.",
       input_schema: {
@@ -195,6 +205,15 @@ export class Agent {
       case "cancel_rule": return this.rules.cancelRule(input.ruleId);
       case "list_rules": return this.rules.listRules();
       case "diagnose_market": return this.pm.diagnose(input.query);
+      case "set_trading_mode": {
+        config.dryRun = !input.live;
+        this.store.state.settings.dryRun = !input.live;
+        this.store.save();
+        const entry = this.store.addActivity("system",
+          input.live ? "TRADING MODE: LIVE - orders are real from now on." : "TRADING MODE: DRY RUN - orders are simulated.",
+          { level: "warn" });
+        return { mode: input.live ? "LIVE" : "DRY_RUN", note: entry.text };
+      }
       case "get_activity": {
         const limit = input.limit || 20;
         return this.store.state.activity.slice(-limit);
