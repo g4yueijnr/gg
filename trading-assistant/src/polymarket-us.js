@@ -600,7 +600,7 @@ export class PolymarketUSClient {
    *   SELL + YES -> SELL_LONG     SELL + NO -> SELL_SHORT
    * For NO orders, `price` is the NO price (what you pay per NO share).
    */
-  async placeOrder({ tokenId, side, price, size, outcomeSide = "YES" }) {
+  async placeOrder({ tokenId, side, price, size, outcomeSide = "YES", allowMarketable = false }) {
     this._assertTradable();
     this.checkLimits({ price, size });
     tokenId = await this.canonicalTokenId(tokenId); // never order against a stale id
@@ -609,6 +609,40 @@ export class PolymarketUSClient {
     const intent = short
       ? (sell ? "ORDER_INTENT_SELL_SHORT" : "ORDER_INTENT_BUY_SHORT")
       : (sell ? "ORDER_INTENT_SELL_LONG" : "ORDER_INTENT_BUY_LONG");
+
+    // CRITICAL: the exchange's single order book is priced in YES terms. A NO
+    // (short) order's price must be converted to YES: yesPrice = 1 - noPrice.
+    // (`price` in and out of this function is always the user's chosen side.)
+    const execPrice = short ? Math.round((1 - price) * 1000) / 1000 : price;
+
+    // Money-safety guard: a limit order meant to REST must not silently cross
+    // the spread and take liquidity at a worse price. Check against the live
+    // book and refuse unless the caller explicitly allows a marketable fill.
+    if (!allowMarketable) {
+      let book = null;
+      try { book = this.books.get(tokenId) || await this.getOrderBook(tokenId); } catch { /* no book -> allow */ }
+      if (book && (book.bestBid !== null && book.bestBid !== undefined || book.bestAsk !== null && book.bestAsk !== undefined)) {
+        // In YES-book terms: buying YES / selling NO takes from asks; selling
+        // YES / buying NO takes from bids.
+        const yesBookBuy = intent === "ORDER_INTENT_BUY_LONG" || intent === "ORDER_INTENT_SELL_SHORT";
+        const crosses = yesBookBuy
+          ? (book.bestAsk !== null && book.bestAsk !== undefined && execPrice >= book.bestAsk)
+          : (book.bestBid !== null && book.bestBid !== undefined && execPrice <= book.bestBid);
+        if (crosses) {
+          const yourSide = short ? "NO" : "YES";
+          const noAsk = book.bestAsk !== null ? Math.round((1 - book.bestAsk) * 1000) / 1000 : null;
+          const noBid = book.bestBid !== null ? Math.round((1 - book.bestBid) * 1000) / 1000 : null;
+          const shownAsk = short ? noAsk : book.bestAsk;
+          const shownBid = short ? noBid : book.bestBid;
+          throw new Error(
+            `Refusing to place: a ${yourSide} ${sell ? "sell" : "buy"} at ${(price * 100).toFixed(0)}¢ would fill IMMEDIATELY ` +
+            `(current ${yourSide} bid ${shownBid !== null ? (shownBid * 100).toFixed(0) + "¢" : "?"} / ask ${shownAsk !== null ? (shownAsk * 100).toFixed(0) + "¢" : "?"}), ` +
+            `not rest. To buy without crossing, bid below the ask. If you actually want to fill now at the market, say so explicitly.`,
+          );
+        }
+      }
+    }
+
     if (config.dryRun) {
       return { success: true, dryRun: true, orderID: `dry-${Date.now()}`, status: "SIMULATED - DRY_RUN is on, no real order was sent", intent };
     }
@@ -622,7 +656,7 @@ export class PolymarketUSClient {
 
     // Try price encodings until the exchange accepts (rotate only on HTTP 400
     // validation rejects - anything else propagates). Remember what worked.
-    const candidates = priceCandidates(price, this.priceScale);
+    const candidates = priceCandidates(execPrice, this.priceScale);
     if (this._priceFormatIdx !== undefined) {
       candidates.unshift(candidates.splice(this._priceFormatIdx, 1)[0]);
     }
@@ -688,13 +722,16 @@ export class PolymarketUSClient {
       const intent = o.intent || "";
       const sell = intent.includes("SELL") || o.side === "ORDER_SIDE_SELL";
       const short = intent.includes("SHORT");
+      const yesPrice = this._toDollars(o.price);
+      // Show the price in the user's own side: NO orders convert back from YES.
+      const shownPrice = short && yesPrice !== null ? Math.round((1 - yesPrice) * 1000) / 1000 : yesPrice;
       return {
         orderId: o.id,
         tokenId: o.marketSlug,
         market: o.marketMetadata?.title || o.marketSlug,
         side: `${sell ? "SELL" : "BUY"}${short ? " NO" : ""}`,
         outcomeSide: short ? "NO" : "YES",
-        price: this._toDollars(o.price),
+        price: shownPrice,
         size: o.quantity,
         filled: o.cumQuantity || 0,
         outcome: o.marketMetadata?.outcome || "",

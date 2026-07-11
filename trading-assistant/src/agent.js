@@ -31,6 +31,7 @@ How to behave:
 - Order books: results may include a "note" field explaining data quality (e.g. depth unavailable, market suspended). Relay it. If a book comes back empty but the user says they can see orders in the app, NEVER insist the book is empty - immediately run diagnose_market on it and report which step failed with the raw evidence. The background engine reads the same data you do, so a broken book means broken outbidding: treat it as urgent, don't shrug it off.
 - Empty book but the app shows a price? The app can display last-trade or indicative odds even when NO orders are resting. Ask the user to open the market's order book/depth view in the app and read you an actual bid - if there are no resting bids, the book really is empty and an auto-outbid rule needs an explicit starting price (there is nobody to outbid yet).
 - Prices: users often speak in cents ("10c", "ten cents") - convert to dollars per share (0.10). Shares are also called contracts.
+- "Bid X" / "place an order at X" means a RESTING limit order - it must NOT fill immediately. Leave fillNow=false (default). The engine refuses any order that would cross the spread; if it's refused, tell the user their price would fill instantly and ask if they want to rest lower or truly take the market. Only set fillNow=true when the user explicitly says "market", "fill now", "take it", or "buy at the ask".
 - YES vs NO on Polymarket US: every market is the YES side of its question. "Buy NO" = side BUY + outcomeSide NO at the NO price (buying 100 NO at 0.60 costs $60 and pays $100 if the answer is no). NEVER translate "buy NO" into a SELL - SELL means exiting shares already owned. Order books include noBestBid/noBestAsk showing the live NO-side prices; use those when quoting NO markets. On Polymarket global, No is a separate outcome token - trade it via its own tokenId.
 - Never invent market data - always read it from tools.`;
 
@@ -63,9 +64,10 @@ function toolDefs() {
         properties: {
           tokenId: { type: "string" },
           side: { type: "string", enum: ["BUY", "SELL"], description: "BUY opens/adds a position, SELL exits one you own" },
-          outcomeSide: { type: "string", enum: ["YES", "NO"], description: "Polymarket US only: which side of the market. Default YES. For NO, price is the NO price. On Polymarket global, use the No outcome's own tokenId instead." },
-          price: { type: "number" },
+          outcomeSide: { type: "string", enum: ["YES", "NO"], description: "Polymarket US only: which side of the market. Default YES. For NO, price is the NO price (the engine converts to the exchange's YES-terms automatically). On Polymarket global, use the No outcome's own tokenId instead." },
+          price: { type: "number", description: "Limit price in the chosen side's terms (NO price for a NO order). A BUY below the ask RESTS; it does not fill immediately." },
           size: { type: "number" },
+          fillNow: { type: "boolean", description: "Default false. Leave false for a resting limit order ('bid X') - the engine will REFUSE an order that would cross the spread and fill immediately. Set true ONLY when the user explicitly wants to take the market / fill right now at a worse price." },
         },
         required: ["tokenId", "side", "price", "size"],
       },
@@ -212,7 +214,7 @@ export class Agent {
     switch (name) {
       case "search_markets": return this.pm.searchMarkets(input.query);
       case "get_order_book": return this.pm.getOrderBook(input.tokenId);
-      case "place_order": return this.pm.placeOrder(input);
+      case "place_order": return this.pm.placeOrder({ ...input, allowMarketable: !!input.fillNow });
       case "cancel_order": return this.pm.cancelOrder(input.orderId);
       case "list_open_orders": return this.pm.getOpenOrders();
       case "get_positions": return this.pm.getPositions();

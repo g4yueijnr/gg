@@ -171,6 +171,7 @@ export class RulesEngine {
     try {
       const resp = await this.pm.placeOrder({
         tokenId: rule.tokenId, side: "SELL", price, size: qty, outcomeSide: rule.outcomeSide,
+        allowMarketable: true, // exits are meant to execute, not rest
       });
       this._log(rule, `EXIT placed: selling ${qty} at ${fmt(price)} (order ${String(resp.orderID).slice(0, 12)}...).`, "success");
     } catch (err) {
