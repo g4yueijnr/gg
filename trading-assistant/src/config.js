@@ -10,10 +10,11 @@ export const config = {
 
   // --- Anthropic / Claude (the chatbot brain) ---
   anthropicApiKey: process.env.ANTHROPIC_API_KEY || "",
-  // Sonnet follows trading instructions much more reliably than Haiku (worth
-  // the ~5c/message for real-money work). Set CLAUDE_MODEL=claude-haiku-4-5
-  // to trade quality for cost.
-  model: process.env.CLAUDE_MODEL || "claude-sonnet-5",
+  // Haiku is ~3x cheaper than Sonnet and plenty now that the trading logic
+  // (pricing, crossing guard, order books) lives in the engine, not the AI -
+  // the model just relays correct tool results. Set CLAUDE_MODEL=claude-sonnet-5
+  // only if you want a sharper chat and don't mind the cost.
+  model: process.env.CLAUDE_MODEL || "claude-haiku-4-5",
 
   // --- Polymarket US (the regulated US app) ---
   // Get both from https://polymarket.us/developer after verifying your account in the iOS app.

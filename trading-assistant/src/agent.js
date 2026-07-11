@@ -267,7 +267,11 @@ export class Agent {
       for (let iter = 0; iter < 12; iter++) {
         const stream = this.client.messages.stream({
           model: config.model,
-          max_tokens: 8000,
+          // Chat replies are short confirmations, not essays. Capping output low
+          // is the single biggest credit saver: you only pay for tokens you use,
+          // but a runaway model can burn thousands per reply. 1500 is plenty for
+          // "placed your bid" style answers and still fits a full order book dump.
+          max_tokens: 1500,
           system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
           tools,
           messages,
@@ -328,7 +332,10 @@ export class Agent {
    */
   _trimHistory() {
     const messages = this.store.state.messages;
-    const MAX = 40;
+    // Every past message is re-sent (and re-billed) on each new turn, so a long
+    // memory quietly multiplies cost. 16 keeps enough recent context to stay
+    // coherent while cutting the per-turn token bill roughly in half vs 40.
+    const MAX = 16;
     if (messages.length <= MAX) return;
     let cut = messages.length - MAX;
     while (cut < messages.length) {
