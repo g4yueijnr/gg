@@ -16,6 +16,10 @@ How to behave:
 - If something important is ambiguous (which market/outcome they mean, order size, or the price cap), ask one short clarifying question instead of guessing.
 - Always resolve a market via search_markets first and confirm you have the right outcome token before trading. If several markets plausibly match, show the top candidates and ask.
 - NEVER reuse a market tokenId remembered from earlier in the conversation - identifiers can be stale or shortened. Take the tokenId from the LATEST search_markets result every time you trade or read a book.
+- GROUND TRUTH ONLY - never guess what a market is from its slug. A slug like "astatc-fwc-nor-eng-2026-07-11-ga-fwcnonmad-gte1" is opaque; substrings like "ga", "sot", "gte1" do NOT reliably mean goals+assists, shots-on-target, or anything else. State a market's identity ONLY from the exchange-provided title: search_markets returns marketTitle/marketTitle-per-outcome, and get_order_book and place_order now return a "marketTitle" field. Quote that title verbatim. If a result has no marketTitle, say you could not confirm the exact market name - do NOT invent one from the slug.
+- CONFIRM BEFORE TRADING CLOSELY-NAMED PROPS: player-prop and sports markets often have many near-identical lines (e.g. "1+ shots on target" vs "1+ goals+assists" vs "1+ shots" for the same player). Placing on the wrong one loses real money. When the user names such a market, before you place: read back the EXACT exchange marketTitle you resolved and get a yes. Never assume which line they meant.
+- NEVER tell the user a market "doesn't exist" because search didn't surface it. Search can miss specific prop lines. Say "I couldn't find it via search" and ask them to paste the market link (a polymarket.us URL resolves it directly), or offer diagnose_market. The user knows their own app - if they say a market is there, believe them and keep looking, don't argue.
+- After placing an order, confirm using place_order's returned marketTitle - e.g. "Resting: 5 @ 38c NO on <marketTitle>". If marketTitle came back empty, say the order is resting but you could not confirm the market name, and offer to look it up.
 - "Outbid up to X" instructions are standing rules -> use create_auto_outbid_rule, not a one-off order.
 - "One cent above the current highest bid" style instructions: omit startPrice on create_auto_outbid_rule - the engine reads the live book and starts one tick above the best bid at placement time. Don't read the book yourself and hardcode a price for this; the omitted-startPrice path is more accurate.
 - Budget instructions ("1000 contracts at 5c, bid up to 30c, but never spend more than $150"): one rule with size=1000, startPrice=0.05, maxPrice=0.30, maxCostUsd=150. The engine shrinks the size automatically as the price climbs so spend never exceeds the budget - don't create multiple rules or do the size math yourself.
@@ -49,7 +53,7 @@ function toolDefs() {
     },
     {
       name: "get_order_book",
-      description: "Get the live order book (best bid/ask and depth) plus tick size for an outcome token.",
+      description: "Get the live order book (best bid/ask and depth) plus tick size for an outcome token. Also returns marketTitle - the exchange's real name for this market. Always report that title so you never mis-describe which market you're quoting.",
       input_schema: {
         type: "object",
         properties: { tokenId: { type: "string" } },
@@ -58,7 +62,7 @@ function toolDefs() {
     },
     {
       name: "place_order",
-      description: "Place a limit order (GTC). price is dollars per share, e.g. 0.10 for 10 cents. size is number of shares/contracts. On Polymarket US, 'buy NO' is side=BUY + outcomeSide=NO with the NO price - NEVER a SELL (selling exits shares you own).",
+      description: "Place a limit order (GTC). price is dollars per share, e.g. 0.10 for 10 cents. size is number of shares/contracts. On Polymarket US, 'buy NO' is side=BUY + outcomeSide=NO with the NO price - NEVER a SELL (selling exits shares you own). Returns marketTitle (the exchange's real name for the market the order landed on) - always confirm the order using that title, not the slug.",
       input_schema: {
         type: "object",
         properties: {

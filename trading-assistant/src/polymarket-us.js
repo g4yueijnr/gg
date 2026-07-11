@@ -91,6 +91,7 @@ export class PolymarketUSClient {
     this.orderMarketSlugs = new Map(); // orderId -> marketSlug (cancel needs both)
     this._slugOk = new Set();          // slugs confirmed tradable
     this._slugAlias = new Map();       // short/stale slug -> canonical tradable slug
+    this._metaCache = new Map();       // slug -> {title, outcome, closed} from the exchange
     // Known slug prefixes (the quote services serve markets under prefixed
     // names like "astatc-<slug>"). Seeded from live observations; new ones
     // are learned automatically whenever a short/long pair is discovered.
@@ -253,10 +254,13 @@ export class PolymarketUSClient {
     }
     const results = out.slice(0, limit);
     // Search truncates each event's market list - fetch full events so every
-    // prop (e.g. "before round 4") is present, not just the popular ones.
-    // MERGE, never replace: slugs straight from search are the exchange's
-    // canonical ones; event payloads sometimes carry shortened variants.
-    await Promise.all(results.slice(0, 3).map(async (r) => {
+    // prop (e.g. "shots on target", "before round 4") is present, not just the
+    // popular ones. A player-prop event ("Norway vs England") can carry dozens
+    // of lines; if we don't pull them all the assistant can wrongly conclude a
+    // real market "doesn't exist". MERGE, never replace: slugs straight from
+    // search are the exchange's canonical ones; event payloads sometimes carry
+    // shortened variants.
+    await Promise.all(results.slice(0, 6).map(async (r) => {
       if (!r.slug) return;
       try {
         const full = await this.api.events.retrieveBySlug(r.slug);
@@ -268,11 +272,27 @@ export class PolymarketUSClient {
           outcome: mk.outcome || mk.title,
           marketTitle: mk.title,
           tokenId: mk.slug,
-        }))).slice(0, 25);
+        })));
+        // Float the outcomes whose titles best match the query to the front so
+        // a specific ask ("shots on target") isn't buried under 40 other props,
+        // then bound the list so one event can't crowd out the response.
+        this._rankOutcomes(r.outcomes, query);
+        r.outcomes = r.outcomes.slice(0, 60);
       } catch { /* keep the search-provided subset */ }
     }));
     await this._attachQuotes(results);
     return results;
+  }
+
+  /** Order an event's outcomes by how well their title matches the search terms. */
+  _rankOutcomes(outcomes, query) {
+    const terms = String(query).toLowerCase().match(/[a-z0-9]+/g) || [];
+    if (!terms.length) return;
+    const score = (o) => {
+      const hay = `${o.marketTitle || ""} ${o.outcome || ""}`.toLowerCase();
+      return terms.reduce((n, t) => n + (hay.includes(t) ? 1 : 0), 0);
+    };
+    outcomes.sort((a, b) => score(b) - score(a));
   }
 
   /** Add live best bid/ask to search results so the assistant sees real prices immediately. */
@@ -375,6 +395,32 @@ export class PolymarketUSClient {
       closed: !!m.closed,
       outcomes: [{ outcome: m.outcome || m.title, tokenId: m.slug }],
     };
+  }
+
+  /**
+   * The exchange's OWN name for a market (title + which outcome), so the
+   * assistant reports ground truth instead of guessing from slug substrings.
+   * This is the anti-gaslighting fix: a slug like "...ga-fwcnonmad-gte1" tells
+   * you nothing reliable - only the exchange knows it's "Noni Madueke 1+ Shots".
+   * Cached; returns nulls (never throws) so it can safely decorate any result.
+   */
+  async resolveMarketMeta(slug) {
+    if (!slug) return { title: null, outcome: null };
+    const canon = this._slugAlias.get(slug) || slug;
+    if (this._metaCache.has(canon)) return this._metaCache.get(canon);
+    let meta = { title: null, outcome: null, closed: false };
+    for (const s of [canon, slug]) {
+      try {
+        const r = await this.api.markets.retrieveBySlug(s);
+        const m = r?.market;
+        if (m?.title) {
+          meta = { title: m.title, outcome: m.outcome || null, closed: !!m.closed };
+          break;
+        }
+      } catch { /* try the other name, then give up quietly */ }
+    }
+    this._metaCache.set(canon, meta);
+    return meta;
   }
 
   // ---------- order book / prices ----------
@@ -485,6 +531,17 @@ export class PolymarketUSClient {
   }
 
   async getOrderBook(slug) {
+    const summary = await this._getOrderBookRaw(slug);
+    // Always stamp the exchange's real market name onto the book so the
+    // assistant states WHAT it's quoting instead of decoding the slug itself.
+    try {
+      const meta = await this.resolveMarketMeta(summary.tokenId || slug);
+      if (meta.title) { summary.marketTitle = meta.title; summary.outcome = meta.outcome; }
+    } catch { /* book still valid without the label */ }
+    return summary;
+  }
+
+  async _getOrderBookRaw(slug) {
     // Resolve shortened/stale market ids to the canonical tradable slug first.
     if (!this._slugOk.has(slug)) {
       const fixed = await this.canonicalTokenId(slug);
@@ -620,7 +677,7 @@ export class PolymarketUSClient {
     // book and refuse unless the caller explicitly allows a marketable fill.
     if (!allowMarketable) {
       let book = null;
-      try { book = this.books.get(tokenId) || await this.getOrderBook(tokenId); } catch { /* no book -> allow */ }
+      try { book = this.books.get(tokenId) || await this._getOrderBookRaw(tokenId); } catch { /* no book -> allow */ }
       if (book && (book.bestBid !== null && book.bestBid !== undefined || book.bestAsk !== null && book.bestAsk !== undefined)) {
         // In YES-book terms: buying YES / selling NO takes from asks; selling
         // YES / buying NO takes from bids.
@@ -643,8 +700,11 @@ export class PolymarketUSClient {
       }
     }
 
+    // The exchange's real name for what we're about to trade - so the
+    // confirmation states the ACTUAL market, never a slug-guess.
+    const meta = await this.resolveMarketMeta(tokenId);
     if (config.dryRun) {
-      return { success: true, dryRun: true, orderID: `dry-${Date.now()}`, status: "SIMULATED - DRY_RUN is on, no real order was sent", intent };
+      return { success: true, dryRun: true, orderID: `dry-${Date.now()}`, status: "SIMULATED - DRY_RUN is on, no real order was sent", intent, marketTitle: meta.title, marketSlug: tokenId, outcomeSide };
     }
     const base = {
       marketSlug: tokenId,
@@ -697,7 +757,7 @@ export class PolymarketUSClient {
       if (String(err.message).includes("REJECTED")) throw err;
       // retrieval hiccup only - reconcile will confirm shortly
     }
-    return { success: true, orderID: orderId, intent, verified };
+    return { success: true, orderID: orderId, intent, verified, marketTitle: meta.title, marketSlug: tokenId, outcomeSide };
   }
 
   async cancelOrder(orderId) {
