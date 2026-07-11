@@ -314,6 +314,16 @@ export class PolymarketUSClient {
           }
         } catch { /* next variant */ }
       }
+      // REST gave nothing - try the live feed (same source the app uses).
+      const live = await this._liveQuote([...new Set(tries)], 4000);
+      if (live && (live.bestBid !== null || live.bestAsk !== null)) {
+        o.tokenId = live.tokenId;
+        o.bestBid = live.bestBid;
+        o.bestAsk = live.bestAsk;
+        delete o.quotes;
+        if (live.tokenId !== original) this._slugAlias.set(original, live.tokenId);
+        return;
+      }
       o.quotes = "no quotes under any known id - call get_order_book on this tokenId before concluding anything about liquidity";
     }));
   }
@@ -415,6 +425,65 @@ export class PolymarketUSClient {
     return null;
   }
 
+  /**
+   * One-shot live read from the market WebSocket - the same feed the Polymarket
+   * app uses. When the REST book/bbo endpoints come back empty but the market
+   * is actually liquid, this is where the real book lives. Tries the slug and
+   * its name variants; resolves on the first message that carries orders.
+   */
+  async _liveQuote(slugs, timeoutMs = 5000) {
+    return new Promise((resolve) => {
+      let ws = null;
+      let done = false;
+      const finish = (val) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        try { ws?.close(); } catch { /* noop */ }
+        resolve(val);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      try {
+        ws = this.api.ws.markets();
+        const onFull = (msg) => {
+          const d = msg.marketData || msg.market_data || msg;
+          const s = d?.marketSlug || d?.market_slug;
+          if (!s || !slugs.includes(s)) return;
+          const nb = unwrapBook(d);
+          if (nb.bids.length || nb.asks.length) {
+            finish(this._summarizeBook(s, nb.bids, nb.asks, nb.stats?.lastTradePx));
+          }
+        };
+        const onLite = (msg) => {
+          const d = msg.marketDataLite || msg.market_data_lite || msg;
+          const s = d?.marketSlug || d?.market_slug;
+          if (!s || !slugs.includes(s)) return;
+          const bestBid = this._toDollars(d.bestBid ?? d.best_bid);
+          const bestAsk = this._toDollars(d.bestAsk ?? d.best_ask);
+          if (bestBid === null && bestAsk === null) return;
+          this.books.set(s, { bestBid, bestAsk, ts: Date.now() });
+          this.lastBookAt.set(s, Date.now());
+          finish({
+            tokenId: s, bestBid, bestAsk,
+            noBestBid: bestAsk !== null ? Math.round((1 - bestAsk) * 1000) / 1000 : null,
+            noBestAsk: bestBid !== null ? Math.round((1 - bestBid) * 1000) / 1000 : null,
+            bids: bestBid !== null ? [{ price: bestBid, size: null }] : [],
+            asks: bestAsk !== null ? [{ price: bestAsk, size: null }] : [],
+            tickSize: 0.01,
+            note: "Live best bid/ask from the market feed (REST depth was unavailable).",
+          });
+        };
+        ws.on("marketData", onFull);
+        ws.on("marketDataLite", onLite);
+        ws.on("error", () => { /* timeout handles it */ });
+        ws.connect().then(() => {
+          ws.subscribeMarketData(`bkq-${Date.now()}`, slugs);
+          try { ws.subscribeMarketDataLite?.(`bkl-${Date.now()}`, slugs); } catch { /* optional */ }
+        }).catch(() => finish(null));
+      } catch { finish(null); }
+    });
+  }
+
   async getOrderBook(slug) {
     // Resolve shortened/stale market ids to the canonical tradable slug first.
     if (!this._slugOk.has(slug)) {
@@ -439,6 +508,17 @@ export class PolymarketUSClient {
         console.log(`[polymarket-us] book data found under "${alt}" (was asked for "${slug}")`);
         return summary;
       }
+    }
+
+    // REST is dry across every name variant - go to the live WebSocket feed
+    // (the same source the app uses). Try the slug and all its variants.
+    const wsSlugs = [slug, ...this._altSlugs(slug)];
+    summary = await this._liveQuote(wsSlugs);
+    if (summary) {
+      this._slugOk.add(summary.tokenId);
+      if (summary.tokenId !== slug) this._slugAlias.set(slug, summary.tokenId);
+      console.log(`[polymarket-us] book data found on the live feed under "${summary.tokenId}"`);
+      return summary;
     }
 
     // Still nothing: figure out WHY so the assistant can say something useful
