@@ -124,6 +124,11 @@ export class RulesEngine {
     if (!rule) return;
     this._enqueue(rule.id, async () => {
       if (rule.status !== "active" && rule.status !== "capped") return;
+      // Ignore events for an order this rule has already moved past (e.g. the
+      // CANCEL for the old order during a cancel-and-replace). Its fills, if
+      // any, are reconciled by _captureLateFills; crediting them here against
+      // the NEW order's counter would double-count.
+      if (rule.orderId !== evt.orderId) return;
       if (evt.rejectReason || String(evt.state).includes("REJECT")) {
         this._log(rule, `Exchange REJECTED my order: ${evt.rejectReason || evt.state}. Rule paused.`, "warn");
         rule.status = "error";
@@ -323,18 +328,22 @@ export class RulesEngine {
   async cancelRule(ruleId, reason = "cancelled by user") {
     const rule = this.getRule(ruleId);
     if (!rule) throw new Error(`No rule with id ${ruleId}`);
-    if (rule.status === "active" || rule.status === "capped") {
-      if (rule.orderId) {
-        try { await this.pm.cancelOrder(rule.orderId); } catch (err) {
-          console.warn(`[rules] cancel order ${rule.orderId} failed: ${err.message}`);
-        }
+    // Already terminated and its order is gone - nothing to do.
+    if (rule.status === "cancelled" || rule.status === "expired") return rule;
+    // ALWAYS try to pull the resting order, whatever the rule's status. An
+    // "error" (or even "filled") rule can still have a live order on the book -
+    // that's exactly how the reconcile race used to orphan orders - so cancel
+    // it before deactivating, or a "fresh" rule ends up bidding against it.
+    if (rule.orderId) {
+      try { await this.pm.cancelOrder(rule.orderId); } catch (err) {
+        console.warn(`[rules] cancel order ${rule.orderId} failed: ${err.message}`);
       }
-      rule.status = "cancelled";
-      rule.updatedAt = new Date().toISOString();
-      clearTimeout(this._expiryTimers.get(rule.id));
-      this.store.save();
-      this._log(rule, `Rule cancelled (${reason}). Resting order removed.`);
     }
+    rule.status = "cancelled";
+    rule.updatedAt = new Date().toISOString();
+    clearTimeout(this._expiryTimers.get(rule.id));
+    this.store.save();
+    this._log(rule, `Rule cancelled (${reason}). Resting order removed.`);
     return rule;
   }
 
@@ -585,25 +594,49 @@ export class RulesEngine {
       return; // transient
     }
     const openById = new Map(open.map((o) => [o.orderId, o]));
-    for (const rule of active) {
-      const o = openById.get(rule.orderId);
-      if (o) {
-        await this._applyFillProgress(rule, o.filled); // idempotent; exits fire inside
-        continue;
-      }
-      // Order no longer open: either fully filled or cancelled externally.
-      let detail;
-      try {
-        detail = await this.pm.getOrder(rule.orderId);
-      } catch {
-        continue; // transient error - re-check next cycle
-      }
-      const matched = detail ? Number(detail.size_matched || 0) : null;
-      // Credit any fills of the vanished order that we hadn't counted yet
-      // (idempotent; sell-after-fill exits fire inside).
-      if (matched !== null) {
-        await this._applyFillProgress(rule, matched);
-      }
+    // Run each rule's check THROUGH its action lock so it can never interleave
+    // with a cancel-and-replace in _evaluate. Without this, reconcile could see
+    // the just-cancelled old order missing and wrongly mark a healthy,
+    // still-outbidding rule as "error" (which also orphaned its new order).
+    await Promise.all(active.map((rule) => {
+      const snapOrderId = rule.orderId;
+      return new Promise((resolve) => {
+        this._enqueue(rule.id, async () => {
+          try { await this._reconcileRule(rule, openById, snapOrderId); }
+          finally { resolve(); }
+        });
+      });
+    }));
+  }
+
+  async _reconcileRule(rule, openById, snapOrderId) {
+    if (rule.status !== "active" || !rule.orderId) return;
+    // The order was replaced while we were listing open orders - the new one
+    // gets checked next cycle; don't judge it against a stale snapshot.
+    if (rule.orderId !== snapOrderId) return;
+
+    const o = openById.get(rule.orderId);
+    if (o) {
+      await this._applyFillProgress(rule, o.filled); // idempotent; exits fire inside
+      return;
+    }
+    // Not in the (possibly stale) open-orders snapshot: verify against the
+    // LIVE order before concluding anything.
+    let detail;
+    try {
+      detail = await this.pm.getOrder(rule.orderId);
+    } catch {
+      return; // transient error - re-check next cycle
+    }
+    const matched = detail ? Number(detail.size_matched || 0) : null;
+    // Credit any fills first (idempotent), then decide the order's fate.
+    if (matched !== null) await this._applyFillProgress(rule, matched);
+    // Still resting - the snapshot was just stale (common right after a
+    // re-bid). Leave the rule active; NEVER error a live order.
+    const liveStatus = String(detail?.status || "").toUpperCase();
+    if (liveStatus === "LIVE" || liveStatus === "OPEN") return;
+    {
+      // The order is genuinely gone (filled or cancelled outside the app).
       const orderFullyFilled = matched !== null && matched >= (rule.mySize ?? rule.size) - 1e-9;
       const budgetLeft = rule.maxCostUsd ? rule.maxCostUsd - (rule.spentUsd || 0) : Infinity;
       const wantMore = rule.size - (rule.filledSize || 0);
