@@ -18,9 +18,64 @@ export class RulesEngine {
     this._lastAction = new Map(); // ruleId -> ts of last repost (throttle)
     this._reconcileTimer = null;
     this._expiryTimers = new Map(); // ruleId -> timer for precise timed cancels
+    // Every order id the engine has ever placed. Lets us safely cancel a rule's
+    // own strays (a re-bid whose old order didn't die) WITHOUT ever touching an
+    // order the user placed by hand. This is the guard against self-bidding wars.
+    this._engineOrderIds = new Set();
+  }
+
+  /** Record an order the engine placed, so strays can be swept without touching manual orders. */
+  _trackOrder(orderId) {
+    if (orderId) this._engineOrderIds.add(orderId);
+  }
+
+  /** Find an engine-placed BUY order for this rule's market+side already resting (to reattach, not duplicate). */
+  async _findEngineOrder(rule) {
+    if (this.pm.readonly) return null;
+    let open;
+    try { open = await this.pm.getOpenOrders(); } catch { return null; }
+    const side = rule.outcomeSide || "YES";
+    return open.find((o) =>
+      o.tokenId === rule.tokenId &&
+      (o.outcomeSide || "YES") === side &&
+      String(o.side || "").startsWith("BUY") &&
+      this._engineOrderIds.has(o.orderId),
+    ) || null;
+  }
+
+  /**
+   * Enforce the invariant "one rule = at most one live order". After a rule
+   * places/moves its order, cancel any OTHER still-live order the engine placed
+   * on the same market and side. This kills leftover orders from a re-bid whose
+   * cancel silently failed - the exact thing that stacked up dozens of orders
+   * and started a bidding war with itself. Manual (user-placed) orders are never
+   * touched, because only engine-placed ids are eligible.
+   */
+  async _sweepDuplicates(rule) {
+    if (this.pm.readonly) return;
+    let open;
+    try { open = await this.pm.getOpenOrders(); } catch { return; }
+    const side = rule.outcomeSide || "YES";
+    for (const o of open) {
+      if (o.orderId === rule.orderId) continue;
+      if (o.tokenId !== rule.tokenId) continue;
+      if ((o.outcomeSide || "YES") !== side) continue;
+      if (!String(o.side || "").startsWith("BUY")) continue;
+      if (!this._engineOrderIds.has(o.orderId)) continue; // never cancel a manual order
+      try {
+        await this.pm.cancelOrder(o.orderId);
+        this._log(rule, `Cleaned up a stray duplicate order (${String(o.orderId).slice(0, 10)}…) so only one bid rests.`, "warn");
+      } catch (err) {
+        console.warn(`[rules] sweep cancel ${o.orderId} failed: ${err.message}`);
+      }
+    }
   }
 
   start() {
+    // Seed the engine-order registry from persisted rules so, after a restart,
+    // stray-order sweeps and re-attach recognize orders we placed before.
+    for (const r of this.store.state.rules) this._trackOrder(r.orderId);
+
     this.pm.onBookUpdate((summary) => this._onBook(summary));
     // Real-time fills/cancels/rejects from the exchange's private stream -
     // the primary fill path; reconcile below is the safety net.
@@ -263,6 +318,20 @@ export class RulesEngine {
     // Pin the rule to whichever market id the book actually answered under,
     // so the live feed, polling, and orders all speak the same name.
     if (book.tokenId && book.tokenId !== tokenId) tokenId = book.tokenId;
+
+    // HARD GUARD: never allow two live rules on the same market + side. Two such
+    // rules outbid EACH OTHER in an endless loop, stacking dozens of orders and
+    // burning the budget. Refuse and point the caller at the existing rule.
+    const dup = this.store.state.rules.find(
+      (r) => (r.status === "active" || r.status === "capped") &&
+        r.tokenId === tokenId && (r.outcomeSide || "YES") === outcomeSide,
+    );
+    if (dup) {
+      throw new Error(
+        `You already have an active ${outcomeSide} auto-outbid rule on this market (${dup.id}, bidding ${fmt(dup.myPrice)} up to ${fmt(dup.maxPrice)}). ` +
+        `Two rules on the same market/side would bid against each other. Update ${dup.id} (change its cap/size) or cancel it first, instead of creating a second one.`,
+      );
+    }
     // View the book from the side we're bidding on (NO bid = mirror of YES ask).
     const view = sideView(outcomeSide, book.bestBid, book.bestAsk);
 
@@ -335,6 +404,7 @@ export class RulesEngine {
     rule.orderId = resp.orderID;
     rule.myPrice = target;
     rule.mySize = initialSize;
+    this._trackOrder(rule.orderId);
     this.store.state.rules.push(rule);
     this.store.save();
 
@@ -486,6 +556,24 @@ export class RulesEngine {
       return;
     }
 
+    // Before placing, make sure we're not about to DOUBLE UP: if an engine order
+    // for this market/side is already resting (a spurious "vanished" that was
+    // actually still live), adopt it instead of stacking a second bid.
+    const existing = await this._findEngineOrder(rule);
+    if (existing) {
+      rule.orderId = existing.orderId;
+      if (existing.price != null) rule.myPrice = existing.price;
+      rule.mySize = existing.size ?? rule.mySize;
+      rule.orderFilledSeen = existing.filled || 0;
+      rule._healFails = 0;
+      rule._nextHealAt = 0;
+      rule.updatedAt = new Date().toISOString();
+      this.store.save();
+      this._log(rule, `Found my order still resting (${fmt(rule.myPrice)}) - reattached to it instead of placing a duplicate.`, "info");
+      await this._sweepDuplicates(rule);
+      return;
+    }
+
     try {
       const resp = await this.pm.placeOrder({ tokenId: rule.tokenId, side: "BUY", price: target, size, outcomeSide: rule.outcomeSide });
       rule.orderId = resp.orderID;
@@ -497,7 +585,9 @@ export class RulesEngine {
       rule._healFails = 0;
       rule._nextHealAt = 0;
       rule.updatedAt = new Date().toISOString();
+      this._trackOrder(rule.orderId);
       this.store.save();
+      await this._sweepDuplicates(rule);
       this._log(rule, `Re-placed my resting bid: ${size} ${rule.outcomeSide === "NO" ? "NO " : ""}@ ${fmt(target)}${reason ? ` (${reason})` : ""}.`, "success");
     } catch (err) {
       // Transient placement failure: keep the rule ALIVE and back off, then
@@ -688,7 +778,9 @@ export class RulesEngine {
     rule._healFails = 0;
     rule._nextHealAt = 0;
     rule.updatedAt = new Date().toISOString();
+    this._trackOrder(rule.orderId);
     this.store.save();
+    await this._sweepDuplicates(rule); // belt-and-suspenders: kill any leftover of the old bid
     const resized = oldSize !== null && oldSize !== finalSize;
     this._log(rule,
       `Outbid detected at ${fmt(freshBid)} - moved my bid ${fmt(oldPrice)} -> ${fmt(freshTarget)} (cap ${fmt(rule.maxPrice)})` +
