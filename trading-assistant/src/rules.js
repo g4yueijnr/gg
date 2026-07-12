@@ -528,14 +528,16 @@ export class RulesEngine {
     if (finalSize <= 0) {
       // The old order filling completed the rule (or exhausted the budget) -
       // don't rest a replacement.
+      rule.orderId = null;
+      rule.status = "filled";
+      rule.updatedAt = new Date().toISOString();
+      this.store.save();
       if ((rule.filledSize || 0) >= rule.size - 1e-9) {
-        rule.status = "filled";
-        rule.orderId = null;
-        this.store.save();
         this._log(rule, `Filled ${rule.filledSize}/${rule.size} of "${rule.outcome}" - rule complete, no re-bid needed.`, "success");
       } else {
-        rule.orderId = null;
-        this.store.save();
+        this._log(rule,
+          `Bought ${rule.filledSize}/${rule.size} of "${rule.outcome}" for $${rule.spentUsd || 0} - the $${rule.maxCostUsd} budget is spent, so I stopped here. ` +
+          `Raise the budget if you want the remaining ${rule.size - rule.filledSize}.`, "warn");
       }
       return;
     }
