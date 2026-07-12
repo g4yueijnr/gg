@@ -27,6 +27,21 @@ export class RulesEngine {
     this.pm.onOrderEvent?.((evt) => this._onOrderEvent(evt));
     this.pm.startPrivateFeed?.();
 
+    // Revive any rule left in "error" by an older build: clear its failure
+    // backoff and mark it active again so the self-heal path re-establishes
+    // its bid. If it still has a live order, reconcile keeps it; if not, it
+    // gets re-placed. Rules the user deliberately cancelled/expired stay put.
+    for (const rule of this.store.state.rules) {
+      if (rule.status === "error") {
+        rule.status = "active";
+        rule._healFails = 0;
+        rule._nextHealAt = 0;
+        rule.updatedAt = new Date().toISOString();
+        this._log(rule, `Resuming this rule automatically (auto-recovery is now on - it will re-place its bid instead of erroring out).`, "info");
+      }
+    }
+    this.store.save();
+
     for (const rule of this.activeRules()) {
       this.pm.watchToken(rule.tokenId);
       this._armExpiry(rule);
@@ -130,10 +145,15 @@ export class RulesEngine {
       // the NEW order's counter would double-count.
       if (rule.orderId !== evt.orderId) return;
       if (evt.rejectReason || String(evt.state).includes("REJECT")) {
-        this._log(rule, `Exchange REJECTED my order: ${evt.rejectReason || evt.state}. Rule paused.`, "warn");
-        rule.status = "error";
+        // A reject on one order must NOT kill the rule. Drop the dead order and
+        // re-establish a fresh, valid bid (with backoff so a persistent reject
+        // can't tight-loop). The rule stays active and keeps competing.
+        this._log(rule, `Exchange rejected my ${fmt(rule.myPrice)} order (${evt.rejectReason || evt.state}) - re-placing a fresh bid.`, "warn");
+        rule.orderId = null;
+        rule._healFails = (rule._healFails || 0) + 1;
+        rule._nextHealAt = Date.now() + Math.min(30000, 500 * 2 ** Math.min(rule._healFails, 6));
         this.store.save();
-        return;
+        return; // reconcile / next book tick heals it once the backoff elapses
       }
       await this._applyFillProgress(rule, evt.cumQuantity);
       // Fully filled? Kick the completion logic (rest next slice / finish rule) now.
@@ -391,8 +411,111 @@ export class RulesEngine {
     const { tokenId, bestBid, bestAsk } = summary;
     for (const rule of this.activeRules()) {
       if (rule.tokenId !== tokenId) continue;
-      // NO rules react to ask moves, YES rules to bid moves - _evaluate sorts it out.
-      this._enqueue(rule.id, () => this._evaluate(rule, bestBid, bestAsk));
+      if (!rule.orderId) {
+        // Active but no live order (recovering from a vanished/rejected order):
+        // re-establish the bid the instant the book moves, instead of waiting.
+        this._enqueue(rule.id, () => this._ensureResting(rule, "book moved"));
+      } else {
+        // NO rules react to ask moves, YES rules to bid moves - _evaluate sorts it out.
+        this._enqueue(rule.id, () => this._evaluate(rule, bestBid, bestAsk));
+      }
+    }
+  }
+
+  /**
+   * Self-healing: make sure an ACTIVE rule has a live resting order. Called
+   * whenever a rule's order vanished for ANY reason - a rejected re-bid, an
+   * order cancelled outside the app, a transient exchange hiccup, or a
+   * budget-shrunk slice that fully filled. The engine RE-PLACES the bid rather
+   * than ever parking itself in an error state. Safe to call repeatedly; a
+   * failure backoff keeps a genuinely dead market from being hammered.
+   */
+  async _ensureResting(rule, reason = "") {
+    if (rule.status !== "active" || rule.orderId) return;
+    if (rule._nextHealAt && Date.now() < rule._nextHealAt) return; // backoff after failures
+
+    const wantMore = rule.size - (rule.filledSize || 0);
+    if (wantMore <= 1e-9) {
+      rule.status = "filled";
+      rule.updatedAt = new Date().toISOString();
+      this.store.save();
+      this._log(rule, `Filled ${rule.filledSize}/${rule.size} of "${rule.outcome}" - rule complete.`, "success");
+      return;
+    }
+
+    // Freshest book on the side we bid.
+    let book = this.pm.books.get(rule.tokenId);
+    if (!book || Date.now() - (book.ts || 0) > 15000) {
+      try { book = await this.pm.getOrderBook(rule.tokenId); }
+      catch { return; } // no book right now - retry next book tick / reconcile
+    }
+    const view = sideView(rule.outcomeSide, book.bestBid, book.bestAsk);
+    const tick = rule.tickSize || 0.01;
+
+    // Price: keep our level, but if the market now bids at/above it, outbid one
+    // tick (never past the cap).
+    let target = rule.myPrice || rule.startPrice || null;
+    if (target === null) {
+      if (view.bid === null) return; // nothing to price against yet
+      target = round(Math.min(view.bid + tick, rule.maxPrice));
+    } else if (view.bid !== null && view.bid >= target) {
+      target = round(Math.min(view.bid + tick, rule.maxPrice));
+    }
+    target = round(Math.min(target, rule.maxPrice));
+
+    // Can't compete right now without crossing or breaking the cap: hold (stay
+    // active, no order) and retry when the book comes back into range.
+    if (view.ask !== null && view.ask !== undefined && target >= view.ask) {
+      this._healHold(rule, `Can't re-rest at ${fmt(target)} without crossing the ${rule.outcomeSide} ask (${fmt(view.ask)}) - holding, will retry when the market moves.`);
+      return;
+    }
+    if (view.bid !== null && view.bid >= rule.maxPrice) {
+      this._healHold(rule, `Market ${rule.outcomeSide} bid ${fmt(view.bid)} is at/above my ${fmt(rule.maxPrice)} cap - holding. Raise the cap to keep competing.`);
+      return;
+    }
+
+    // Size within remaining shares and budget.
+    let size = wantMore;
+    if (rule.maxCostUsd) size = Math.min(size, Math.floor((rule.maxCostUsd - (rule.spentUsd || 0)) / target));
+    size = Math.max(Math.floor(size), 0);
+    if (size < 1) {
+      rule.status = "filled";
+      rule.updatedAt = new Date().toISOString();
+      this.store.save();
+      this._log(rule, `Bought ${rule.filledSize}/${rule.size} for $${rule.spentUsd || 0} - the $${rule.maxCostUsd} budget is spent, stopping here.`, "warn");
+      return;
+    }
+
+    try {
+      const resp = await this.pm.placeOrder({ tokenId: rule.tokenId, side: "BUY", price: target, size, outcomeSide: rule.outcomeSide });
+      rule.orderId = resp.orderID;
+      rule.myPrice = target;
+      rule.mySize = size;
+      rule.orderFilledSeen = 0;
+      rule.cappedNotified = false;
+      rule.budgetNotified = false;
+      rule._healFails = 0;
+      rule._nextHealAt = 0;
+      rule.updatedAt = new Date().toISOString();
+      this.store.save();
+      this._log(rule, `Re-placed my resting bid: ${size} ${rule.outcomeSide === "NO" ? "NO " : ""}@ ${fmt(target)}${reason ? ` (${reason})` : ""}.`, "success");
+    } catch (err) {
+      // Transient placement failure: keep the rule ALIVE and back off, then
+      // retry. This is what used to (wrongly) flip rules to "error".
+      rule._healFails = (rule._healFails || 0) + 1;
+      rule._nextHealAt = Date.now() + Math.min(30000, 500 * 2 ** Math.min(rule._healFails, 6));
+      this.store.save();
+      this._healHold(rule, `Couldn't re-place my bid (${err.message}) - will retry shortly.`, true);
+    }
+  }
+
+  /** Throttled "holding / retrying" notice so recovery never spams the feed. */
+  _healHold(rule, msg, warn = false) {
+    const now = Date.now();
+    const last = (this._healWarnTs ||= new Map()).get(rule.id) || 0;
+    if (now - last > 30000) {
+      this._healWarnTs.set(rule.id, now);
+      this._log(rule, msg, warn ? "warn" : "info");
     }
   }
 
@@ -541,13 +664,29 @@ export class RulesEngine {
       }
       return;
     }
-    const resp = await this.pm.placeOrder({ tokenId: rule.tokenId, side: "BUY", price: freshTarget, size: finalSize, outcomeSide: rule.outcomeSide });
+    // Old order is confirmed gone; drop its id before placing so a failed
+    // placement can never leave the rule pointing at a dead order.
+    rule.orderId = null;
+    let resp;
+    try {
+      resp = await this.pm.placeOrder({ tokenId: rule.tokenId, side: "BUY", price: freshTarget, size: finalSize, outcomeSide: rule.outcomeSide });
+    } catch (err) {
+      // Re-bid placement failed - keep the rule alive and let the self-heal
+      // path re-establish the bid (with backoff). Never error out.
+      rule._healFails = (rule._healFails || 0) + 1;
+      rule._nextHealAt = Date.now() + Math.min(30000, 500 * 2 ** Math.min(rule._healFails, 6));
+      this.store.save();
+      this._healHold(rule, `Couldn't move my bid to ${fmt(freshTarget)} (${err.message}) - will retry.`, true);
+      return;
+    }
     rule.orderId = resp.orderID;
     rule.myPrice = freshTarget;
     rule.mySize = finalSize;
     rule.orderFilledSeen = 0;
     rule.cappedNotified = false;
     rule.budgetNotified = false;
+    rule._healFails = 0;
+    rule._nextHealAt = 0;
     rule.updatedAt = new Date().toISOString();
     this.store.save();
     const resized = oldSize !== null && oldSize !== finalSize;
@@ -612,28 +751,41 @@ export class RulesEngine {
     for (const rule of this.activeRules()) {
       await this._expireIfDue(rule);
     }
-    const active = this.activeRules().filter((r) => r.orderId);
-    if (active.length === 0 || this.pm.readonly) return;
-    let open;
-    try {
-      open = await this.pm.getOpenOrders();
-    } catch {
-      return; // transient
+    if (this.pm.readonly) return;
+    const withOrder = this.activeRules().filter((r) => r.orderId);
+    const withoutOrder = this.activeRules().filter((r) => !r.orderId);
+    if (withOrder.length === 0 && withoutOrder.length === 0) return;
+
+    let openById = new Map();
+    if (withOrder.length) {
+      try {
+        const open = await this.pm.getOpenOrders();
+        openById = new Map(open.map((o) => [o.orderId, o]));
+      } catch {
+        return; // transient - re-check next cycle
+      }
     }
-    const openById = new Map(open.map((o) => [o.orderId, o]));
-    // Run each rule's check THROUGH its action lock so it can never interleave
-    // with a cancel-and-replace in _evaluate. Without this, reconcile could see
-    // the just-cancelled old order missing and wrongly mark a healthy,
-    // still-outbidding rule as "error" (which also orphaned its new order).
-    await Promise.all(active.map((rule) => {
+    // Run every rule's check THROUGH its action lock so it can never interleave
+    // with a cancel-and-replace in _evaluate. Rules with a live order get
+    // reconciled; rules that lost their order get re-placed (self-heal), so a
+    // rule NEVER sits idle in an error state.
+    const jobs = [];
+    for (const rule of withOrder) {
       const snapOrderId = rule.orderId;
-      return new Promise((resolve) => {
+      jobs.push(new Promise((resolve) => {
         this._enqueue(rule.id, async () => {
-          try { await this._reconcileRule(rule, openById, snapOrderId); }
-          finally { resolve(); }
+          try { await this._reconcileRule(rule, openById, snapOrderId); } finally { resolve(); }
         });
-      });
-    }));
+      }));
+    }
+    for (const rule of withoutOrder) {
+      jobs.push(new Promise((resolve) => {
+        this._enqueue(rule.id, async () => {
+          try { await this._ensureResting(rule, "recovering a lost order"); } finally { resolve(); }
+        });
+      }));
+    }
+    await Promise.all(jobs);
   }
 
   async _reconcileRule(rule, openById, snapOrderId) {
@@ -663,44 +815,26 @@ export class RulesEngine {
     const liveStatus = String(detail?.status || "").toUpperCase();
     if (liveStatus === "LIVE" || liveStatus === "OPEN") return;
     {
-      // The order is genuinely gone (filled or cancelled outside the app).
-      const orderFullyFilled = matched !== null && matched >= (rule.mySize ?? rule.size) - 1e-9;
-      const budgetLeft = rule.maxCostUsd ? rule.maxCostUsd - (rule.spentUsd || 0) : Infinity;
+      // The order is genuinely gone (filled, or cancelled outside the app).
       const wantMore = rule.size - (rule.filledSize || 0);
-      const affordable = Math.min(wantMore, Math.floor(budgetLeft / (rule.myPrice || 1)));
+      const budgetSpent = rule.maxCostUsd && (rule.maxCostUsd - (rule.spentUsd || 0)) < (rule.myPrice || 0);
 
-      if (orderFullyFilled && wantMore > 1e-9 && affordable >= 1) {
-        // A budget-shrunk order filled completely but the rule isn't done -
-        // rest the next slice at the same price and keep going.
-        try {
-          const resp = await this.pm.placeOrder({
-            tokenId: rule.tokenId, side: "BUY", price: rule.myPrice,
-            size: affordable, outcomeSide: rule.outcomeSide,
-          });
-          rule.orderId = resp.orderID;
-          rule.mySize = affordable;
-          rule.orderFilledSeen = 0;
-          rule.updatedAt = new Date().toISOString();
-          this.store.save();
-          this._log(rule, `Order filled (${rule.filledSize}/${rule.size} total, $${rule.spentUsd || 0} spent) - resting the next ${affordable} shares at ${fmt(rule.myPrice)}.`, "success");
-        } catch (err) {
-          rule.status = "error";
-          this.store.save();
-          this._log(rule, `Order filled but re-resting the remainder failed: ${err.message}. Rule paused.`, "warn");
-        }
-      } else if (orderFullyFilled || (rule.filledSize || 0) >= rule.size - 1e-9 || (rule.maxCostUsd && affordable < 1 && matched !== null)) {
+      if (wantMore <= 1e-9 || budgetSpent) {
+        // Nothing left to buy (size done or budget spent) -> complete cleanly.
         rule.status = "filled";
+        rule.orderId = null;
         rule.updatedAt = new Date().toISOString();
         this.store.save();
         this._log(rule,
-          `ORDER FILLED: bought ${rule.filledSize} shares of "${rule.outcome}" (latest at ${fmt(rule.myPrice)}${rule.spentUsd ? `, $${rule.spentUsd} total` : ""}). Rule complete.`, "success");
-      } else {
-        rule.status = "error";
-        rule.updatedAt = new Date().toISOString();
-        this.store.save();
-        this._log(rule,
-          `My resting order disappeared (cancelled outside the app${matched ? `, ${matched} filled` : ""}). Rule paused - recreate it if still wanted.`, "warn");
+          `ORDER COMPLETE: bought ${rule.filledSize} shares of "${rule.outcome}"${rule.spentUsd ? ` for $${rule.spentUsd}` : ""}. Rule done.`, "success");
+        return;
       }
+      // Still wants more: whatever happened (a slice filled, an external cancel,
+      // an exchange hiccup), re-establish the bid. The engine self-heals and
+      // NEVER parks itself in an error state.
+      rule.orderId = null;
+      this.store.save();
+      await this._ensureResting(rule, matched ? "slice filled, resting the rest" : "order vanished, re-placing");
     }
   }
 
