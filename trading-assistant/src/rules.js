@@ -276,7 +276,10 @@ export class RulesEngine {
       tokenId,
       conditionId: conditionId || null,
       marketQuestion: marketQuestion || tokenId,
-      outcome: outcome || "",
+      // The exchange's own name for this market - ground truth for the panel,
+      // so a rule can never be mislabeled from a free-text guess.
+      marketTitle: book.marketTitle || marketQuestion || tokenId,
+      outcome: outcome || book.outcome || "",
       side: "BUY",
       outcomeSide,
       size,
