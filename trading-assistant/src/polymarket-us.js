@@ -149,10 +149,13 @@ export class PolymarketUSClient {
       v = Number(amount);
     }
     if (Number.isNaN(v)) return null;
-    // These contracts always trade strictly below $1, so any value >= 1 must be
-    // cents quoting (e.g. "55" = 55c, and "1" = 1c - never $1).
-    if (v >= 1) this.priceScale = 100;
-    return this.priceScale === 100 || v >= 1 ? v / 100 : v;
+    // Polymarket US Amounts are ALWAYS US dollars as a string: a price of 55c is
+    // {value:"0.55"}, a $62 position cost is {value:"62"}. Return dollars as-is.
+    // (An earlier build guessed that value>=1 meant cents and divided by 100 -
+    // that was WRONG: reading a position's dollar cost would latch the whole
+    // client into a bogus "cents" mode, throwing every book read off by 100x
+    // and making the engine send order prices the exchange rejects. Removed.)
+    return v;
   }
 
   _fromDollars(price) {
