@@ -498,6 +498,10 @@ export class RulesEngine {
     }
     // Cancel-then-replace: the new bid is only placed once the old order is
     // confirmed gone, so we can never end up with two resting bids.
+    const oldPrice = rule.myPrice;
+    const oldSize = rule.mySize;
+    const oldOrderId = rule.orderId;
+    const oldSeen = rule.orderFilledSeen || 0;
     if (rule.orderId) {
       const gone = await this._ensureCancelled(rule);
       if (!gone) {
@@ -509,27 +513,45 @@ export class RulesEngine {
         }
         return; // retry on the next book update
       }
+      // CRITICAL money-safety: the old order may have FILLED in the instant
+      // before it was cancelled. Credit those fills (updates filledSize and
+      // spentUsd) BEFORE sizing the replacement, so a fill mid-re-bid can
+      // never make us buy past the total size or blow the budget.
+      await this._captureLateFills(rule, oldOrderId, oldPrice, oldSeen);
     }
-    const resp = await this.pm.placeOrder({ tokenId: rule.tokenId, side: "BUY", price: freshTarget, size: remaining, outcomeSide: rule.outcomeSide });
-    const oldPrice = rule.myPrice;
-    const oldSize = rule.mySize;
-    const oldOrderId = rule.orderId;
-    const oldSeen = rule.orderFilledSeen || 0;
+    // Re-size against the freshest fill/budget state now that late fills are in.
+    let reAllowed = rule.size;
+    if (rule.maxCostUsd) {
+      reAllowed = Math.min(reAllowed, Math.floor((rule.maxCostUsd - (rule.spentUsd || 0)) / freshTarget));
+    }
+    const finalSize = Math.max(Math.min(rule.size - (rule.filledSize || 0), reAllowed), 0);
+    if (finalSize <= 0) {
+      // The old order filling completed the rule (or exhausted the budget) -
+      // don't rest a replacement.
+      if ((rule.filledSize || 0) >= rule.size - 1e-9) {
+        rule.status = "filled";
+        rule.orderId = null;
+        this.store.save();
+        this._log(rule, `Filled ${rule.filledSize}/${rule.size} of "${rule.outcome}" - rule complete, no re-bid needed.`, "success");
+      } else {
+        rule.orderId = null;
+        this.store.save();
+      }
+      return;
+    }
+    const resp = await this.pm.placeOrder({ tokenId: rule.tokenId, side: "BUY", price: freshTarget, size: finalSize, outcomeSide: rule.outcomeSide });
     rule.orderId = resp.orderID;
     rule.myPrice = freshTarget;
-    rule.mySize = remaining;
+    rule.mySize = finalSize;
     rule.orderFilledSeen = 0;
     rule.cappedNotified = false;
     rule.budgetNotified = false;
     rule.updatedAt = new Date().toISOString();
     this.store.save();
-    // Catch any last-moment fills on the cancelled order (async - reconcile
-    // would eventually see them, but budget accounting is safer sooner).
-    this._captureLateFills(rule, oldOrderId, oldPrice, oldSeen);
-    const resized = oldSize !== null && oldSize !== remaining;
+    const resized = oldSize !== null && oldSize !== finalSize;
     this._log(rule,
       `Outbid detected at ${fmt(freshBid)} - moved my bid ${fmt(oldPrice)} -> ${fmt(freshTarget)} (cap ${fmt(rule.maxPrice)})` +
-      `${resized ? `, size ${oldSize} -> ${remaining} to stay under the $${rule.maxCostUsd} budget` : ""}.`);
+      `${resized ? `, size ${oldSize} -> ${finalSize} to stay under the $${rule.maxCostUsd} budget` : ""}.`);
   }
 
   /** Credit fills that landed on a just-cancelled order before it died. */
