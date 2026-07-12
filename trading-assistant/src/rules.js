@@ -22,6 +22,10 @@ export class RulesEngine {
     // own strays (a re-bid whose old order didn't die) WITHOUT ever touching an
     // order the user placed by hand. This is the guard against self-bidding wars.
     this._engineOrderIds = new Set();
+    // Serializes rule creation per market+side so two near-simultaneous "create"
+    // calls can't both pass the duplicate check and place two orders (the race
+    // that left a stray order the rule then outbid).
+    this._createLocks = new Map();
   }
 
   /** Record an order the engine placed, so strays can be swept without touching manual orders. */
@@ -113,7 +117,9 @@ export class RulesEngine {
       }
     }
     this._reconcileTimer = setInterval(() => {
-      this._reconcile().catch((err) => console.error("[rules] reconcile error:", err.message));
+      this._reconcile()
+        .then(() => this._detectOrphans())
+        .catch((err) => console.error("[rules] reconcile error:", err.message));
     }, config.reconcileIntervalMs);
     // Startup reconciliation: verify tracked orders against the exchange now
     // and surface any orphaned exchange orders no rule knows about.
@@ -155,14 +161,31 @@ export class RulesEngine {
     return { rulesStopped: stopped, ordersCancelled: cancelled.canceledOrderIds || [] };
   }
 
-  /** Surface exchange orders that no rule is tracking (placed manually or lost). */
+  /**
+   * Sweep exchange orders no rule is managing. An order the ENGINE placed but
+   * that no active rule now points at is a stray from a create/re-bid glitch -
+   * cancel it (that's the leftover that starts self-bidding wars). Orders we did
+   * NOT place (the user's own manual orders) are only surfaced, never cancelled.
+   */
   async _detectOrphans() {
     if (this.pm.readonly) return;
     let open;
     try { open = await this.pm.getOpenOrders(); } catch { return; }
-    const tracked = new Set(this.store.state.rules.map((r) => r.orderId).filter(Boolean));
+    const tracked = new Set(this.store.state.rules
+      .filter((r) => r.status === "active" || r.status === "capped")
+      .map((r) => r.orderId).filter(Boolean));
     for (const o of open) {
-      if (!tracked.has(o.orderId)) {
+      if (tracked.has(o.orderId)) continue;
+      if (this._engineOrderIds.has(o.orderId)) {
+        // A stray the engine placed - cancel it so it can't be bid against.
+        try {
+          await this.pm.cancelOrder(o.orderId);
+          this.store.addActivity("system",
+            `Cancelled a stray order no rule was managing (${o.side} ${o.size} @ ${fmt(o.price)} on "${o.market}", ${String(o.orderId).slice(0, 12)}…) to prevent a self-bidding loop.`, { level: "warn" });
+        } catch (err) {
+          console.warn(`[rules] orphan cancel ${o.orderId} failed: ${err.message}`);
+        }
+      } else {
         this.store.addActivity("system",
           `Found an open order no rule is managing: ${o.side} ${o.size} @ ${fmt(o.price)} on "${o.market}" (${String(o.orderId).slice(0, 12)}...). ` +
           `It rests untouched - ask the assistant to cancel it if unwanted.`, { level: "warn" });
@@ -272,11 +295,32 @@ export class RulesEngine {
   }
 
   /**
-   * Create an auto-outbid rule and place its initial order.
+   * Create an auto-outbid rule and place its initial order. Serialized per
+   * market+side so two concurrent creates can't both slip past the duplicate
+   * guard and place two orders.
+   */
+  async createAutoOutbid(params) {
+    const side = String(params.outcomeSide || "YES").toUpperCase() === "NO" ? "NO" : "YES";
+    const key = `${params.tokenId}:${side}`;
+    const prev = this._createLocks.get(key) || Promise.resolve();
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    const mine = prev.then(() => gate);
+    this._createLocks.set(key, mine);
+    try {
+      await prev.catch(() => {}); // wait for any in-flight create on this market+side
+      return await this._createAutoOutbidInner(params);
+    } finally {
+      release();
+      if (this._createLocks.get(key) === mine) this._createLocks.delete(key);
+    }
+  }
+
+  /**
    * startPrice may be omitted -> start one tick above the current best bid.
    * expiresAt (ISO datetime) may be set -> rule auto-cancels at that time.
    */
-  async createAutoOutbid({ tokenId, size, startPrice, maxPrice, marketQuestion, outcome, conditionId, expiresAt, outcomeSide, maxCostUsd, onFill }) {
+  async _createAutoOutbidInner({ tokenId, size, startPrice, maxPrice, marketQuestion, outcome, conditionId, expiresAt, outcomeSide, maxCostUsd, onFill }) {
     // onFill: what to do when contracts fill. {mode:"none"} (default),
     // {mode:"limit", price} (rest a sell at price), or {mode:"immediate"}
     // (marketable sell into the live best bid, per fill).
@@ -410,6 +454,7 @@ export class RulesEngine {
 
     this.pm.watchToken(tokenId);
     this._armExpiry(rule);
+    await this._sweepDuplicates(rule); // clear any stray order left on this market+side
     this._log(rule,
       `Rule created: bidding ${fmt(target)} for ${initialSize} ${outcomeSide === "NO" ? "NO " : ""}shares of "${rule.outcome}" - will auto-outbid up to ${fmt(maxPrice)}` +
       `${rule.maxCostUsd ? `, budget $${rule.maxCostUsd} (size shrinks as price rises)` : ""}` +
