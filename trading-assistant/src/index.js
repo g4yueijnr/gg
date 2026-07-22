@@ -6,6 +6,7 @@ import { Store } from "./store.js";
 import { Polymarket } from "./polymarket.js";
 import { PolymarketUSClient } from "./polymarket-us.js";
 import { RulesEngine } from "./rules.js";
+import { PingPongEngine } from "./pingpong-engine.js";
 import { Agent } from "./agent.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -42,7 +43,9 @@ async function main() {
 
   const rules = new RulesEngine({ polymarket: pm, store, notify });
   rules.start();
-  const agent = new Agent({ polymarket: pm, rules, store });
+  const pingpong = new PingPongEngine({ polymarket: pm, store, notify });
+  pingpong.start();
+  const agent = new Agent({ polymarket: pm, rules, store, pingpong });
 
   // Self-report health into the Activity feed so status is visible in the app
   // itself - no log-digging or manual testing needed.
@@ -106,9 +109,27 @@ async function main() {
       platform: pm.platform,
       wallet: pm.funder,
       rules: rules.listRules().slice().reverse(),
+      strategies: pingpong.listStrategies().slice().reverse(),
       openOrders,
       activity: store.state.activity.slice(-100).reverse(),
     });
+  });
+
+  // External live-score feed fallback: any score provider can POST the current
+  // score here and the ping-pong engine trades on it exactly like the built-in
+  // poller. Body: {gamesA,gamesB,ptsA,ptsB} or {whoScored:"A"|"B"}.
+  app.post("/api/pingpong/:id/score", async (req, res) => {
+    try {
+      const s = await pingpong.updateScore(req.params.id, req.body || {});
+      res.json({ ok: true, score: s?.score ?? null });
+    } catch (err) {
+      res.status(400).json({ error: err.message });
+    }
+  });
+
+  app.post("/api/pingpong/:id/stop", async (req, res) => {
+    try { res.json(await pingpong.stopStrategy(req.params.id)); }
+    catch (err) { res.status(400).json({ error: err.message }); }
   });
 
   // --- live activity stream ---

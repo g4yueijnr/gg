@@ -224,7 +224,23 @@ function fmtC(p) { return p == null ? "?" : (Math.round(p * 1000) / 10) + "¢"; 
 
 function render() {
   if (tab === "rules") {
-    panel.innerHTML = state.rules.length ? "" : '<div class="empty">No standing rules yet.<br>Try: “bid 10¢, outbid anyone up to 20¢”.</div>';
+    const strategies = state.strategies || [];
+    panel.innerHTML = (state.rules.length || strategies.length) ? "" : '<div class="empty">No standing rules yet.<br>Try: “bid 10¢, outbid anyone up to 20¢”.</div>';
+    // Ping-pong live-quoting strategies first (they're the always-on automated ones).
+    for (const st of strategies) {
+      const sc = st.score;
+      const div = document.createElement("div");
+      div.className = "card";
+      div.innerHTML =
+        `${st.status === "active" ? '<button class="mini" data-strat="' + esc(st.id) + '">stop</button>' : ""}` +
+        `<div class="title"><span class="side yes">🏓 MODEL</span> ${esc(st.playerA || "A")} vs ${esc(st.playerB || "B")}<span class="badge ${esc(st.status)}">${esc(st.status)}</span></div>` +
+        `<div class="mkt">${esc(st.marketTitle || "")}</div>` +
+        `<div class="sub">` +
+        `${sc ? `score ${sc.gamesA}-${sc.gamesB} games, ${sc.ptsA}-${sc.ptsB} pts · ` : "waiting for live score · "}` +
+        `${st.orderId ? `quoting ${st.orderSide === "NO" ? "B" : "A"} @ ${fmtC(st.orderPrice)}` : "no live quote"}` +
+        ` · $${(st.filledUsd || 0).toFixed(2)}/$${st.maxExposureUsd} held · $${st.perTradeUsd}/quote · ${st.id}</div>`;
+      panel.appendChild(div);
+    }
     for (const r of state.rules) {
       const div = document.createElement("div");
       div.className = "card";
@@ -241,6 +257,10 @@ function render() {
     }
     panel.querySelectorAll("button[data-rule]").forEach((b) => b.onclick = async () => {
       await fetch(`/api/rules/${b.dataset.rule}/cancel`, { method: "POST", headers: authHeaders() });
+      refreshState();
+    });
+    panel.querySelectorAll("button[data-strat]").forEach((b) => b.onclick = async () => {
+      await fetch(`/api/pingpong/${b.dataset.strat}/stop`, { method: "POST", headers: authHeaders() });
       refreshState();
     });
   } else if (tab === "orders") {

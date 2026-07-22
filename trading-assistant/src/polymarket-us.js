@@ -53,6 +53,92 @@ function unwrapBbo(raw) {
 function levelPrice(l) { return l.px ?? l.price ?? l.p; }
 function levelQty(l) { return l.qty ?? l.quantity ?? l.size ?? l.q; }
 
+// ---------- live table-tennis score extraction ----------
+const num = (v) => (v === null || v === undefined || v === "" || Number.isNaN(Number(v)) ? null : Number(v));
+
+/**
+ * Pull a table-tennis live score out of an arbitrary sports-data JSON blob.
+ * Returns { gamesA, gamesB, ptsA, ptsB } (A = the market's YES outcome) or null.
+ *
+ * Handles the two shapes live TT feeds actually use:
+ *  (1) a per-game/period array, e.g. game.periods = [{home:11,away:7},{home:9,away:11},{home:5,away:3}]
+ *      -> completed games counted by who hit 11 (win-by-2); the last, in-progress
+ *         period is the current points.
+ *  (2) explicit fields anywhere: games/sets won + current points, any casing
+ *      (homeGames/awayGames, setsHome/setsAway, homeScore/awayScore + homePoints...).
+ * `homeIsA` maps home/away onto A/B; when unknown we match the outcome name.
+ */
+export function extractLiveScore(raw, outcomeName = null) {
+  const node = findScoreNode(raw);
+  if (!node) return null;
+  let s = fromPeriods(node) || fromExplicit(node);
+  if (!s) return null;
+  // Decide whether "home" is player A (the YES outcome) or player B.
+  let homeIsA = true;
+  const homeName = String(node.homeName || node.home?.name || node.homeTeam?.name || node.competitorHome?.name || "").toLowerCase();
+  const awayName = String(node.awayName || node.away?.name || node.awayTeam?.name || node.competitorAway?.name || "").toLowerCase();
+  const oc = String(outcomeName || "").toLowerCase().trim();
+  if (oc && awayName && awayName.includes(oc)) homeIsA = false;
+  else if (oc && homeName && homeName.includes(oc)) homeIsA = true;
+  const out = homeIsA
+    ? { gamesA: s.homeGames, gamesB: s.awayGames, ptsA: s.homePts, ptsB: s.awayPts }
+    : { gamesA: s.awayGames, gamesB: s.homeGames, ptsA: s.awayPts, ptsB: s.homePts };
+  if ([out.gamesA, out.gamesB, out.ptsA, out.ptsB].some((n) => n === null || n === undefined)) return null;
+  return out;
+}
+
+/** Walk the JSON for the node most likely to carry the live score. */
+function findScoreNode(root) {
+  const seen = new Set();
+  const stack = [root];
+  let best = null;
+  while (stack.length) {
+    const n = stack.pop();
+    if (!n || typeof n !== "object" || seen.has(n)) continue;
+    seen.add(n);
+    const keys = Object.keys(n);
+    const hasPeriods = Array.isArray(n.periods) || Array.isArray(n.sets) || Array.isArray(n.games) || Array.isArray(n.scores);
+    const hasSided = keys.some((k) => /^(home|away)/i.test(k)) || (n.home && n.away) || (n.competitorHome && n.competitorAway);
+    if (hasPeriods || hasSided) { best = best || n; if (hasPeriods) return n; }
+    for (const k of keys) { const v = n[k]; if (v && typeof v === "object") stack.push(v); }
+  }
+  return best;
+}
+
+/** Shape (1): a per-game array. Count finished games; last in-progress = current points. */
+function fromPeriods(node) {
+  const arr = node.periods || node.sets || node.games || node.scores;
+  if (!Array.isArray(arr) || !arr.length) return null;
+  let homeGames = 0, awayGames = 0, homePts = 0, awayPts = 0;
+  for (const g of arr) {
+    const h = num(g.home ?? g.homeScore ?? g.h ?? g[0]);
+    const a = num(g.away ?? g.awayScore ?? g.a ?? g[1]);
+    if (h === null || a === null) continue;
+    const done = (h >= 11 || a >= 11) && Math.abs(h - a) >= 2;
+    if (done) { if (h > a) homeGames++; else awayGames++; }
+    else { homePts = h; awayPts = a; } // the unfinished game holds current points
+  }
+  return { homeGames, awayGames, homePts, awayPts };
+}
+
+/** Shape (2): explicit games + points fields, any reasonable name. */
+function fromExplicit(node) {
+  const pick = (...names) => {
+    for (const nm of names) {
+      for (const k of Object.keys(node)) {
+        if (k.toLowerCase() === nm) { const v = num(node[k]); if (v !== null) return v; }
+      }
+    }
+    return null;
+  };
+  const homeGames = pick("homegames", "gameshome", "setshome", "homesets", "homegameswon");
+  const awayGames = pick("awaygames", "gamesaway", "setsaway", "awaysets", "awaygameswon");
+  const homePts = pick("homepoints", "pointshome", "homescore", "scorehome", "homept");
+  const awayPts = pick("awaypoints", "pointsaway", "awayscore", "scoreaway", "awaypt");
+  if (homeGames === null && homePts === null) return null;
+  return { homeGames: homeGames ?? 0, awayGames: awayGames ?? 0, homePts: homePts ?? 0, awayPts: awayPts ?? 0 };
+}
+
 /** Price encodings the exchange might expect, in order of preference. */
 function priceCandidates(price, priceScale) {
   const dollars = { value: String(Math.round(price * 100) / 100), currency: "USD" };
@@ -385,6 +471,41 @@ export class PolymarketUSClient {
       }
     } catch { /* not an event slug either */ }
     return null;
+  }
+
+  // ---------- live sports score (for model-priced strategies) ----------
+
+  /**
+   * Fetch EVERYTHING the exchange returns about a market and its event, raw and
+   * untouched. The typed SDK omits live game state, but the underlying JSON for
+   * an in-play sports market usually still carries it - this is how we find the
+   * exact field on the live app (call dumpMatchData and read it back).
+   */
+  async dumpMatchData(slug) {
+    const out = { slug, market: null, event: null, errors: [] };
+    try { out.market = await this.api.markets.retrieveBySlug(slug); }
+    catch (e) { out.errors.push(`market: ${e.message}`); }
+    const eventSlug = out.market?.market?.eventSlug || out.market?.event?.slug;
+    if (eventSlug) {
+      try { out.event = await this.api.events.retrieveBySlug(eventSlug); }
+      catch (e) { out.errors.push(`event: ${e.message}`); }
+    }
+    return out;
+  }
+
+  /**
+   * Best-effort live score for a match market, returned as
+   * { gamesA, gamesB, ptsA, ptsB } where A is the market's YES outcome, or null
+   * if no score is present. Defensive by design: the exact shape Polymarket uses
+   * for table-tennis isn't documented, so we scan the raw market+event JSON for
+   * the common live-score patterns. Once we confirm the real shape from
+   * dumpMatchData on the live app, this narrows to the exact path.
+   */
+  async getLiveScore(slug) {
+    let raw;
+    try { raw = await this.dumpMatchData(slug); } catch { return null; }
+    const outcomeName = raw?.market?.market?.outcome || raw?.market?.market?.title || null;
+    return extractLiveScore(raw, outcomeName);
   }
 
   async getMarketByToken(slug) {

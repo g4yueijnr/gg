@@ -42,6 +42,7 @@ How to behave:
 - Prices: users often speak in cents ("10c", "ten cents") - convert to dollars per share (0.10). Shares are also called contracts.
 - "Bid X" / "place an order at X" means a RESTING limit order - it must NOT fill immediately. Leave fillNow=false (default). The engine refuses any order that would cross the spread; if it's refused, tell the user their price would fill instantly and ask if they want to rest lower or truly take the market. Only set fillNow=true when the user explicitly says "market", "fill now", "take it", or "buy at the ask".
 - YES vs NO on Polymarket US: every market is the YES side of its question. "Buy NO" = side BUY + outcomeSide NO at the NO price (buying 100 NO at 0.60 costs $60 and pays $100 if the answer is no). NEVER translate "buy NO" into a SELL - SELL means exiting shares already owned. Order books include noBestBid/noBestAsk showing the live NO-side prices; use those when quoting NO markets. On Polymarket global, No is a separate outcome token - trade it via its own tokenId.
+- PING-PONG / SETKA CUP strategy: for "trade this match off the cheat sheet" style requests, use create_pingpong_strategy on the match market's token (resolve it with search_markets; playerA = the YES side, playerB = the NO side). The engine then runs fully automatically - it reads the live score on its own and keeps a single edge-discounted limit resting on the model's favorite, re-quoting every time the score changes, holding fills to expiry, within the per-trade stake and max-exposure caps. Defaults: $0.25/quote, $20 max exposure, 20%->10% edge, 10s quote life, score read every 3s - only override when the user gives numbers. Confirm the strategy back with those settings. If a strategy warns it isn't getting a live score, run dump_match_data on that token and report the score-looking fields so the reader can be pointed at the right one. One strategy per match market. Never place manual one-off orders to 'help' a strategy.
 - Never invent market data - always read it from tools.`;
 
 /** Tool definitions (Anthropic format). */
@@ -192,14 +193,57 @@ function toolDefs() {
         properties: { limit: { type: "number", description: "Max entries, default 20" } },
       },
     },
+    {
+      name: "create_pingpong_strategy",
+      description: "Start an automated ping-pong (Setka Cup) live-quoting strategy on ONE match market. The background engine reads the live score by itself and keeps a single edge-discounted BUY limit resting on whichever player the cheat-sheet model favors at the current score, re-quoting automatically every time the score changes. Fills are held to expiry. Use for 'trade this match off the cheat sheet' requests. tokenId is the match market's outcome token (its YES = playerA). Resolve it with search_markets first.",
+      input_schema: {
+        type: "object",
+        properties: {
+          tokenId: { type: "string", description: "The match market's outcome token (YES = playerA wins)" },
+          playerA: { type: "string", description: "Name of the YES-side player" },
+          playerB: { type: "string", description: "Name of the NO-side player" },
+          perTradeUsd: { type: "number", description: "Dollars staked per individual quote. Default 0.25." },
+          maxExposureUsd: { type: "number", description: "Hard cap on total money at work in this strategy. Default 20." },
+          edgeEarly: { type: "number", description: "Safety discount off fair value early in the match (0.20 = 20%). Default 0.20." },
+          edgeLate: { type: "number", description: "Safety discount late in the match (0.10 = 10%). Default 0.10." },
+          orderTtlSec: { type: "number", description: "Seconds an unfilled quote rests before auto-pull. Default 10." },
+          pollSec: { type: "number", description: "How often (seconds) to re-read the live score. Default 3." },
+        },
+        required: ["tokenId"],
+      },
+    },
+    {
+      name: "list_pingpong_strategies",
+      description: "List all ping-pong live-quoting strategies with their live score, current quote, filled/held exposure, and status.",
+      input_schema: { type: "object", properties: {} },
+    },
+    {
+      name: "stop_pingpong_strategy",
+      description: "Stop a ping-pong strategy: pulls its resting quote and stops auto-quoting. Filled positions are kept and ride to settlement.",
+      input_schema: {
+        type: "object",
+        properties: { strategyId: { type: "string" } },
+        required: ["strategyId"],
+      },
+    },
+    {
+      name: "dump_match_data",
+      description: "Diagnostic: dump the RAW market + event JSON the exchange returns for a match market, so we can find exactly where the live score lives (the score reader uses this). Use when a ping-pong strategy says it isn't getting a live score. Returns the raw payload - relay the score-looking fields.",
+      input_schema: {
+        type: "object",
+        properties: { tokenId: { type: "string" } },
+        required: ["tokenId"],
+      },
+    },
   ];
 }
 
 export class Agent {
-  constructor({ polymarket, rules, store }) {
+  constructor({ polymarket, rules, store, pingpong }) {
     this.pm = polymarket;
     this.rules = rules;
     this.store = store;
+    this.pingpong = pingpong || null;
     // Don't crash at boot when the key is missing - fail politely in chat instead.
     this.client = config.anthropicApiKey ? new Anthropic({ apiKey: config.anthropicApiKey }) : null;
     this.busy = false;
@@ -246,6 +290,20 @@ export class Agent {
       case "get_activity": {
         const limit = input.limit || 20;
         return this.store.state.activity.slice(-limit);
+      }
+      case "create_pingpong_strategy":
+        if (!this.pingpong) throw new Error("Ping-pong strategy engine is not available.");
+        return this.pingpong.createStrategy(input);
+      case "list_pingpong_strategies":
+        if (!this.pingpong) throw new Error("Ping-pong strategy engine is not available.");
+        return this.pingpong.listStrategies();
+      case "stop_pingpong_strategy":
+        if (!this.pingpong) throw new Error("Ping-pong strategy engine is not available.");
+        return this.pingpong.stopStrategy(input.strategyId);
+      case "dump_match_data": {
+        const raw = await this.pm.dumpMatchData(this.pm.canonicalTokenId ? await this.pm.canonicalTokenId(input.tokenId) : input.tokenId);
+        // Keep it small enough to relay.
+        return JSON.parse(JSON.stringify(raw).slice(0, 6000));
       }
       default: throw new Error(`Unknown tool: ${name}`);
     }

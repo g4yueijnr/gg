@@ -12,10 +12,11 @@ export class Store {
     fs.mkdirSync(dataDir, { recursive: true });
     this.state = {
       rules: [],        // standing instructions (auto-outbid etc.)
+      strategies: [],   // model-priced strategies (e.g. ping-pong live quoting)
       messages: [],     // chat history (Anthropic message format)
       activity: [],     // human-readable activity log
       settings: {},     // runtime overrides (e.g. dryRun toggled from chat)
-      counters: { rule: 0 },
+      counters: { rule: 0, strategy: 0 },
     };
     this._load();
     this._writeTimer = null;
@@ -61,6 +62,13 @@ export class Store {
     this.state.counters.rule += 1;
     this.save();
     return `rule-${this.state.counters.rule}`;
+  }
+
+  nextStrategyId() {
+    if (!this.state.counters.strategy) this.state.counters.strategy = 0;
+    this.state.counters.strategy += 1;
+    this.save();
+    return `pp-${this.state.counters.strategy}`;
   }
 
   addActivity(kind, text, meta = {}) {
