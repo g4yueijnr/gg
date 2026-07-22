@@ -68,7 +68,7 @@ export class PingPongEngine {
    * table-tennis match markets and spin up a strategy on each one we can read a
    * live score for, bounded by maxConcurrent and a per-match exposure cap.
    */
-  async startAutopilot({ perTradeUsd = 0.25, maxExposurePerMatch = 5, maxConcurrent = 8, query = "Setka Cup table tennis", edgeEarly = 0.20, edgeLate = 0.10 } = {}) {
+  async startAutopilot({ perTradeUsd = 0.25, maxExposurePerMatch = 5, maxConcurrent = 8, query = "Setka Cup, table tennis, Setka, table-tennis", edgeEarly = 0.20, edgeLate = 0.10 } = {}) {
     this.store.state.settings ||= {};
     this.store.state.settings.ppAutopilot = { on: true, perTradeUsd, maxExposurePerMatch, maxConcurrent, query, edgeEarly, edgeLate };
     this.store.save();
@@ -130,7 +130,16 @@ export class PingPongEngine {
       }
     }
     if (liveSeen === 0) {
-      this._logThrottledGlobal("nolive", `Autopilot: no STARTED "${cfg.query}" matches found this pass (all results are scheduled for later). Searched ${candidates.length} markets.`, "info");
+      if (candidates.length === 0) {
+        this._logThrottledGlobal("nomatch", `Autopilot: search for [${cfg.query}] returned NO markets at all. If matches are live, the search terms don't match how the exchange names them - tell me the exact match name you see and I'll target it.`, "warn");
+      } else {
+        // Show what we DID find (names + start times) so we can see why nothing is "live".
+        const sample = candidates.slice(0, 6).map((c) => {
+          const when = c.startMs ? new Date(c.startMs).toISOString().slice(5, 16).replace("T", " ") : "no-start-time";
+          return `"${c.marketTitle}" (${c.closed ? "closed" : when})`;
+        }).join("; ");
+        this._logThrottledGlobal("nolive", `Autopilot: found ${candidates.length} matches but none are STARTED yet. Sample: ${sample}. (Now is ${new Date().toISOString().slice(5, 16).replace("T", " ")} UTC.)`, "warn");
+      }
     }
     return started;
   }
@@ -153,22 +162,29 @@ export class PingPongEngine {
    */
   async _discoverMatches(query) {
     if (!this.pm.searchMarkets) return [];
-    let res = [];
-    try { res = await this.pm.searchMarkets(query, 25); } catch { return []; }
+    // Try SEVERAL queries and merge - one phrase like "Setka Cup table tennis"
+    // can match nothing while "table tennis" or "Setka" finds every match.
+    const queries = (Array.isArray(query) ? query : String(query || "").split(","))
+      .map((q) => q.trim()).filter(Boolean);
+    if (!queries.length) queries.push("Setka Cup", "table tennis");
     const seen = new Set();
     const cands = [];
-    for (const ev of res || []) {
-      const title = ev.eventTitle || ev.question || "";
-      for (const o of ev.outcomes || []) {
-        if (!o.tokenId || seen.has(o.tokenId)) continue;
-        seen.add(o.tokenId);
-        const { a, b } = parseVersus(o.marketTitle || title);
-        cands.push({
-          tokenId: o.tokenId,
-          playerA: o.outcome || a || "Player A",
-          playerB: otherName(o.outcome || a, a, b) || "Player B",
-          marketTitle: o.marketTitle || title,
-        });
+    for (const q of queries) {
+      let res = [];
+      try { res = await this.pm.searchMarkets(q, 25); } catch { continue; }
+      for (const ev of res || []) {
+        const title = ev.eventTitle || ev.question || "";
+        for (const o of ev.outcomes || []) {
+          if (!o.tokenId || seen.has(o.tokenId)) continue;
+          seen.add(o.tokenId);
+          const { a, b } = parseVersus(o.marketTitle || title);
+          cands.push({
+            tokenId: o.tokenId,
+            playerA: o.outcome || a || "Player A",
+            playerB: otherName(o.outcome || a, a, b) || "Player B",
+            marketTitle: o.marketTitle || title,
+          });
+        }
       }
     }
     // Enrich (bounded) with the live details the search doesn't carry.
