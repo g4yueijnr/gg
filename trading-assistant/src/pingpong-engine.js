@@ -1,4 +1,11 @@
 import { matchWinProb, matchProgress, modelBuyPrice } from "./pingpong.js";
+import { extractLiveScore } from "./polymarket-us.js";
+
+const START_FIELDS = ["gameStartTime", "gameTime", "startTime", "startDate", "eventStartTime", "gameStart", "startsAt", "scheduledTime"];
+function parseStart(m) {
+  for (const f of START_FIELDS) { if (m && m[f]) { const t = Date.parse(m[f]); if (!Number.isNaN(t)) return t; } }
+  return null;
+}
 
 /**
  * Ping-pong (Setka Cup) live-quoting strategy engine.
@@ -98,45 +105,93 @@ export class PingPongEngine {
     if (!cfg?.on) return 0;
     let candidates = [];
     try { candidates = await this._discoverMatches(cfg.query); } catch { return 0; }
-    let started = 0;
+    const now = Date.now();
+    let started = 0, liveSeen = 0;
     for (const c of candidates) {
-      if (this.activeStrategies().length >= cfg.maxConcurrent) break;
+      if (c.closed) continue;
+      const isStarted = c.startMs !== null && c.startMs <= now + 60000; // started (or about to)
+      if (!isStarted) continue; // scheduled for later - skip until it starts
+      liveSeen++;
       if (this.activeStrategies().find((s) => s.tokenId === c.tokenId)) continue;
-      // Only trade matches we can actually read a live score for - no point
-      // arming a strategy on a match that hasn't started or has no score feed.
-      let sc = null;
-      try { sc = await this.pm.getLiveScore(c.tokenId); } catch { /* skip */ }
-      if (!sc) continue;
-      try {
-        await this.createStrategy({
-          tokenId: c.tokenId, playerA: c.playerA, playerB: c.playerB, marketQuestion: c.marketTitle,
-          perTradeUsd: cfg.perTradeUsd, maxExposureUsd: cfg.maxExposurePerMatch,
-          edgeEarly: cfg.edgeEarly, edgeLate: cfg.edgeLate,
-        });
-        started++;
-      } catch { /* already running or not tradable */ }
+      if (this.activeStrategies().length >= cfg.maxConcurrent) continue;
+      if (c.score) {
+        try {
+          await this.createStrategy({
+            tokenId: c.tokenId, playerA: c.playerA, playerB: c.playerB, marketQuestion: c.marketTitle,
+            perTradeUsd: cfg.perTradeUsd, maxExposureUsd: cfg.maxExposurePerMatch,
+            edgeEarly: cfg.edgeEarly, edgeLate: cfg.edgeLate,
+          });
+          started++;
+        } catch { /* already running or not tradable */ }
+      } else {
+        // STARTED but we couldn't read a score. Surface exactly what the exchange
+        // DOES return for this in-play match so the reader can be pinpointed.
+        this._diagnoseNoScore(c);
+      }
+    }
+    if (liveSeen === 0) {
+      this._logThrottledGlobal("nolive", `Autopilot: no STARTED "${cfg.query}" matches found this pass (all results are scheduled for later). Searched ${candidates.length} markets.`, "info");
     }
     return started;
   }
 
-  /** Search the exchange for table-tennis match markets and normalize to {tokenId, playerA, playerB, marketTitle}. */
+  /** Log the raw score-looking fields for a live match we can't price, so we can pinpoint the score. */
+  _diagnoseNoScore(c) {
+    const now = Date.now();
+    this._diagTs ||= new Map();
+    if (now - (this._diagTs.get(c.tokenId) || 0) < 180000) return; // once every 3 min per match
+    this._diagTs.set(c.tokenId, now);
+    const hunt = (c.scoreHunt || []).slice(0, 12).map((h) => `${h.path}=${h.value}`).join(" | ") || "(no score-looking fields in the payload)";
+    this.store.addActivity("pingpong",
+      `LIVE match "${c.marketTitle}" is in-play but I can't read its score. Raw fields the exchange returns: ${hunt}`, { level: "warn" });
+  }
+
+  /**
+   * Discover candidate match markets and enrich each with start time / closed /
+   * live score by pulling its market payload once. Normalizes to
+   * {tokenId, playerA, playerB, marketTitle, startMs, closed, score, scoreHunt}.
+   */
   async _discoverMatches(query) {
     if (!this.pm.searchMarkets) return [];
-    const res = await this.pm.searchMarkets(query, 20);
-    const out = [];
+    let res = [];
+    try { res = await this.pm.searchMarkets(query, 25); } catch { return []; }
     const seen = new Set();
+    const cands = [];
     for (const ev of res || []) {
       const title = ev.eventTitle || ev.question || "";
       for (const o of ev.outcomes || []) {
         if (!o.tokenId || seen.has(o.tokenId)) continue;
         seen.add(o.tokenId);
         const { a, b } = parseVersus(o.marketTitle || title);
-        const playerA = o.outcome || a || "Player A";
-        const playerB = otherName(playerA, a, b) || "Player B";
-        out.push({ tokenId: o.tokenId, playerA, playerB, marketTitle: o.marketTitle || title });
+        cands.push({
+          tokenId: o.tokenId,
+          playerA: o.outcome || a || "Player A",
+          playerB: otherName(o.outcome || a, a, b) || "Player B",
+          marketTitle: o.marketTitle || title,
+        });
       }
     }
-    return out;
+    // Enrich (bounded) with the live details the search doesn't carry.
+    await Promise.all(cands.slice(0, 30).map(async (c) => {
+      try {
+        const dump = await this.pm.dumpMatchData(c.tokenId);
+        const m = dump.market?.market || dump.market || {};
+        c.startMs = parseStart(m);
+        c.closed = m.closed === true;
+        c.scoreHunt = dump.scoreHunt || [];
+        c.score = extractLiveScore(dump, m.outcome);
+      } catch { c.startMs = null; c.closed = false; c.scoreHunt = []; c.score = null; }
+    }));
+    return cands;
+  }
+
+  _logThrottledGlobal(key, text, level) {
+    const now = Date.now();
+    this._gWarnTs ||= new Map();
+    if (now - (this._gWarnTs.get(key) || 0) > 180000) {
+      this._gWarnTs.set(key, now);
+      this.store.addActivity("pingpong", text, { level });
+    }
   }
 
   /**
