@@ -43,7 +43,8 @@ How to behave:
 - Prices: users often speak in cents ("10c", "ten cents") - convert to dollars per share (0.10). Shares are also called contracts.
 - "Bid X" / "place an order at X" means a RESTING limit order - it must NOT fill immediately. Leave fillNow=false (default). The engine refuses any order that would cross the spread; if it's refused, tell the user their price would fill instantly and ask if they want to rest lower or truly take the market. Only set fillNow=true when the user explicitly says "market", "fill now", "take it", or "buy at the ask".
 - YES vs NO on Polymarket US: every market is the YES side of its question. "Buy NO" = side BUY + outcomeSide NO at the NO price (buying 100 NO at 0.60 costs $60 and pays $100 if the answer is no). NEVER translate "buy NO" into a SELL - SELL means exiting shares already owned. Order books include noBestBid/noBestAsk showing the live NO-side prices; use those when quoting NO markets. On Polymarket global, No is a separate outcome token - trade it via its own tokenId.
-- PING-PONG / SETKA CUP strategy: for "trade this match off the cheat sheet" style requests, use create_pingpong_strategy on the match market's token (resolve it with search_markets; playerA = the YES side, playerB = the NO side). The engine then runs fully automatically - it reads the live score on its own and keeps a single edge-discounted limit resting on the model's favorite, re-quoting every time the score changes, holding fills to expiry, within the per-trade stake and max-exposure caps. Defaults: $0.25/quote, $20 max exposure, 20%->10% edge, 10s quote life, score read every 3s - only override when the user gives numbers. Confirm the strategy back with those settings. If a strategy warns it isn't getting a live score, run dump_match_data on that token and report the score-looking fields so the reader can be pointed at the right one. One strategy per match market. Never place manual one-off orders to 'help' a strategy.
+- "TRADE WHATEVER IS LIVE" / "trade all live ping pong" / "just trade live": use trade_all_live_pingpong (autopilot). It auto-discovers every live table-tennis match and runs the strategy on each, rediscovering new ones every 60s - no need to name matches. Pass perTradeUsd/maxExposurePerMatch/maxConcurrent only if the user gives numbers. Confirm it's on and that it only trades matches it can read a live score for. To halt, use stop_all_pingpong.
+- PING-PONG / SETKA CUP strategy (a SPECIFIC match): for "trade this match off the cheat sheet" style requests, use create_pingpong_strategy on the match market's token (resolve it with search_markets; playerA = the YES side, playerB = the NO side). The engine then runs fully automatically - it reads the live score on its own and keeps a single edge-discounted limit resting on the model's favorite, re-quoting every time the score changes, holding fills to expiry, within the per-trade stake and max-exposure caps. Defaults: $0.25/quote, $20 max exposure, 20%->10% edge, 10s quote life, score read every 3s - only override when the user gives numbers. Confirm the strategy back with those settings. If a strategy warns it isn't getting a live score, run dump_match_data on that token and report the score-looking fields so the reader can be pointed at the right one. One strategy per match market. Never place manual one-off orders to 'help' a strategy.
 - Never invent market data - always read it from tools.`;
 
 /** Tool definitions (Anthropic format). */
@@ -214,6 +215,27 @@ function toolDefs() {
       },
     },
     {
+      name: "trade_all_live_pingpong",
+      description: "AUTOPILOT: automatically find EVERY live table-tennis / Setka Cup match and run the cheat-sheet strategy on each one, hands-free. Rediscovers new live matches every 60s and only trades matches it can read a live score for. Use for 'just trade whatever is live' / 'trade all live ping pong' requests. Each match gets its own per-match exposure cap.",
+      input_schema: {
+        type: "object",
+        properties: {
+          perTradeUsd: { type: "number", description: "Stake per quote. Default 0.25." },
+          maxExposurePerMatch: { type: "number", description: "Max money at work per match. Default 5." },
+          maxConcurrent: { type: "number", description: "Max simultaneous live matches to trade. Default 8." },
+          query: { type: "string", description: "Search phrase for finding matches. Default 'Setka Cup table tennis'." },
+        },
+      },
+    },
+    {
+      name: "stop_all_pingpong",
+      description: "Turn OFF ping-pong autopilot. By default leaves running strategies alone; set stopStrategies=true to also stop every active strategy and pull their quotes.",
+      input_schema: {
+        type: "object",
+        properties: { stopStrategies: { type: "boolean", description: "Also stop all active strategies (default false)." } },
+      },
+    },
+    {
       name: "list_pingpong_strategies",
       description: "List all ping-pong live-quoting strategies with their live score, current quote, filled/held exposure, and status.",
       input_schema: { type: "object", properties: {} },
@@ -295,6 +317,12 @@ export class Agent {
       case "create_pingpong_strategy":
         if (!this.pingpong) throw new Error("Ping-pong strategy engine is not available.");
         return this.pingpong.createStrategy(input);
+      case "trade_all_live_pingpong":
+        if (!this.pingpong) throw new Error("Ping-pong strategy engine is not available.");
+        return this.pingpong.startAutopilot(input);
+      case "stop_all_pingpong":
+        if (!this.pingpong) throw new Error("Ping-pong strategy engine is not available.");
+        return this.pingpong.stopAutopilot({ alsoStopStrategies: !!input.stopStrategies });
       case "list_pingpong_strategies":
         if (!this.pingpong) throw new Error("Ping-pong strategy engine is not available.");
         return this.pingpong.listStrategies();

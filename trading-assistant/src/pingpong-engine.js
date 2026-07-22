@@ -41,14 +41,102 @@ export class PingPongEngine {
       this._enqueue(s.id, () => this._requote(s, "resumed after restart"));
       this._startPoller(s);
     }
+    // Resume autopilot ("trade whatever is live") if it was on before a restart.
+    if (this.store.state.settings?.ppAutopilot?.on) this._armAutopilot();
     console.log(`[pingpong] engine started with ${this.activeStrategies().length} active strategies`);
   }
 
   stop() {
     for (const t of this._ttlTimers.values()) clearTimeout(t);
     for (const t of this._pollTimers.values()) clearInterval(t);
+    clearInterval(this._autopilotTimer);
     this._ttlTimers.clear();
     this._pollTimers.clear();
+  }
+
+  // ---------- autopilot: discover & trade every live match automatically ----------
+
+  /**
+   * Turn on "trade whatever is live": periodically discover live Setka Cup /
+   * table-tennis match markets and spin up a strategy on each one we can read a
+   * live score for, bounded by maxConcurrent and a per-match exposure cap.
+   */
+  async startAutopilot({ perTradeUsd = 0.25, maxExposurePerMatch = 5, maxConcurrent = 8, query = "Setka Cup table tennis", edgeEarly = 0.20, edgeLate = 0.10 } = {}) {
+    this.store.state.settings ||= {};
+    this.store.state.settings.ppAutopilot = { on: true, perTradeUsd, maxExposurePerMatch, maxConcurrent, query, edgeEarly, edgeLate };
+    this.store.save();
+    this.store.addActivity("pingpong",
+      `AUTOPILOT ON - hunting live "${query}" matches every 60s. Trades each live match it can read: $${perTradeUsd}/quote, $${maxExposurePerMatch}/match, up to ${maxConcurrent} at once.`, { level: "success" });
+    this._armAutopilot();
+    const found = await this._autopilotTick(); // do a first pass right away
+    return { on: true, perTradeUsd, maxExposurePerMatch, maxConcurrent, query, startedNow: found };
+  }
+
+  async stopAutopilot({ alsoStopStrategies = false } = {}) {
+    if (this.store.state.settings?.ppAutopilot) this.store.state.settings.ppAutopilot.on = false;
+    clearInterval(this._autopilotTimer);
+    this._autopilotTimer = null;
+    this.store.save();
+    let stopped = 0;
+    if (alsoStopStrategies) {
+      for (const s of this.activeStrategies()) { await this.stopStrategy(s.id, "autopilot stopped"); stopped++; }
+    }
+    this.store.addActivity("pingpong", `AUTOPILOT OFF.${alsoStopStrategies ? ` Stopped ${stopped} strateg${stopped === 1 ? "y" : "ies"}.` : " Existing strategies keep running."}`, { level: "warn" });
+    return { on: false, stoppedStrategies: stopped };
+  }
+
+  _armAutopilot() {
+    clearInterval(this._autopilotTimer);
+    const t = setInterval(() => this._autopilotTick().catch((e) => console.warn("[pingpong] autopilot:", e.message)), 60000);
+    if (t.unref) t.unref();
+    this._autopilotTimer = t;
+  }
+
+  /** One discovery pass: find live matches and start a strategy on each new one. Returns count started. */
+  async _autopilotTick() {
+    const cfg = this.store.state.settings?.ppAutopilot;
+    if (!cfg?.on) return 0;
+    let candidates = [];
+    try { candidates = await this._discoverMatches(cfg.query); } catch { return 0; }
+    let started = 0;
+    for (const c of candidates) {
+      if (this.activeStrategies().length >= cfg.maxConcurrent) break;
+      if (this.activeStrategies().find((s) => s.tokenId === c.tokenId)) continue;
+      // Only trade matches we can actually read a live score for - no point
+      // arming a strategy on a match that hasn't started or has no score feed.
+      let sc = null;
+      try { sc = await this.pm.getLiveScore(c.tokenId); } catch { /* skip */ }
+      if (!sc) continue;
+      try {
+        await this.createStrategy({
+          tokenId: c.tokenId, playerA: c.playerA, playerB: c.playerB, marketQuestion: c.marketTitle,
+          perTradeUsd: cfg.perTradeUsd, maxExposureUsd: cfg.maxExposurePerMatch,
+          edgeEarly: cfg.edgeEarly, edgeLate: cfg.edgeLate,
+        });
+        started++;
+      } catch { /* already running or not tradable */ }
+    }
+    return started;
+  }
+
+  /** Search the exchange for table-tennis match markets and normalize to {tokenId, playerA, playerB, marketTitle}. */
+  async _discoverMatches(query) {
+    if (!this.pm.searchMarkets) return [];
+    const res = await this.pm.searchMarkets(query, 20);
+    const out = [];
+    const seen = new Set();
+    for (const ev of res || []) {
+      const title = ev.eventTitle || ev.question || "";
+      for (const o of ev.outcomes || []) {
+        if (!o.tokenId || seen.has(o.tokenId)) continue;
+        seen.add(o.tokenId);
+        const { a, b } = parseVersus(o.marketTitle || title);
+        const playerA = o.outcome || a || "Player A";
+        const playerB = otherName(playerA, a, b) || "Player B";
+        out.push({ tokenId: o.tokenId, playerA, playerB, marketTitle: o.marketTitle || title });
+      }
+    }
+    return out;
   }
 
   /**
@@ -356,4 +444,25 @@ export class PingPongEngine {
       this._log(s, text, level);
     }
   }
+}
+
+/** Split "A vs B" / "A v B" / "A - B" (any casing/separator) into the two names. */
+export function parseVersus(title) {
+  const t = String(title || "").replace(/\s+/g, " ").trim();
+  const m = t.match(/^(.*?)\s+(?:vs?\.?|versus|-|–|—|@)\s+(.*?)$/i);
+  if (!m) return { a: null, b: null };
+  // Strip trailing qualifiers ("... (Setka Cup)", "... moneyline").
+  const clean = (x) => x.replace(/\s*[\(\[].*$/, "").trim();
+  return { a: clean(m[1]), b: clean(m[2]) };
+}
+
+/** Given the known player (the YES outcome) and the two parsed names, return the other one. */
+export function otherName(known, a, b) {
+  const k = String(known || "").toLowerCase();
+  const na = String(a || "").toLowerCase(), nb = String(b || "").toLowerCase();
+  if (na && k.includes(na.split(" ")[0])) return b;
+  if (nb && k.includes(nb.split(" ")[0])) return a;
+  // Fall back: if known matches a, other is b, else a.
+  if (a && na && k && (k.includes(na) || na.includes(k))) return b;
+  return b && String(b).toLowerCase() !== k ? b : a;
 }
