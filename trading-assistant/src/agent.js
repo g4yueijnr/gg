@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { config } from "./config.js";
+import { extractLiveScore } from "./polymarket-us.js";
 
 const SYSTEM_PROMPT = `You are the user's personal Polymarket trading assistant and trading buddy. You run inside their private trading app, which is connected to their own Polymarket account. There is exactly one user and it is their account, their money, and their explicit standing instruction that you execute trades for them.
 
@@ -228,7 +229,7 @@ function toolDefs() {
     },
     {
       name: "dump_match_data",
-      description: "Diagnostic: dump the RAW market + event JSON the exchange returns for a match market, so we can find exactly where the live score lives (the score reader uses this). Use when a ping-pong strategy says it isn't getting a live score. Returns the raw payload - relay the score-looking fields.",
+      description: "Diagnostic: probe the exchange for a match's live score. Returns scoreHunt (every score-looking field path + value found in the market AND event JSON), extractedScore (what the reader parsed, or null), errors, and the market/event key lists. Use when a ping-pong strategy isn't getting a live score. RELAY scoreHunt VERBATIM (each path and value) and whether eventPresent is true - that's what pinpoints the score field.",
       input_schema: {
         type: "object",
         properties: { tokenId: { type: "string" } },
@@ -301,9 +302,21 @@ export class Agent {
         if (!this.pingpong) throw new Error("Ping-pong strategy engine is not available.");
         return this.pingpong.stopStrategy(input.strategyId);
       case "dump_match_data": {
-        const raw = await this.pm.dumpMatchData(this.pm.canonicalTokenId ? await this.pm.canonicalTokenId(input.tokenId) : input.tokenId);
-        // Keep it small enough to relay.
-        return JSON.parse(JSON.stringify(raw).slice(0, 6000));
+        const tok = this.pm.canonicalTokenId ? await this.pm.canonicalTokenId(input.tokenId) : input.tokenId;
+        const raw = await this.pm.dumpMatchData(tok);
+        const m = raw.market?.market || raw.market || {};
+        const ev = raw.event?.event || raw.event || {};
+        // High-signal, compact result: the score-hunt hits are the whole point.
+        return {
+          slug: tok,
+          outcome: m.outcome ?? null,
+          scoreHunt: raw.scoreHunt,                 // <-- every score-looking field + value
+          extractedScore: (() => { try { return extractLiveScore(raw, m.outcome); } catch { return null; } })(),
+          errors: raw.errors,
+          marketKeys: Object.keys(m),
+          eventKeys: Object.keys(ev),
+          eventPresent: !!raw.event,
+        };
       }
       default: throw new Error(`Unknown tool: ${name}`);
     }

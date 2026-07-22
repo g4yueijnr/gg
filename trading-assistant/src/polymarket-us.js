@@ -87,6 +87,34 @@ export function extractLiveScore(raw, outcomeName = null) {
   return out;
 }
 
+/**
+ * Walk any JSON and collect every field that plausibly encodes a live score -
+ * by key name (score/game/set/point/period/result/live/home/away/leg) or by an
+ * array of per-game objects. Returns [{path, value}] so we can see EXACTLY where
+ * the score lives on the live app (or prove Polymarket doesn't send one).
+ */
+function huntScoreFields(root) {
+  const hits = [];
+  const seen = new Set();
+  const re = /score|games?|sets?|points?|period|leg|result|live|home|away|status|current|inning/i;
+  const walk = (n, path) => {
+    if (!n || typeof n !== "object" || seen.has(n) || hits.length > 60) return;
+    seen.add(n);
+    for (const k of Object.keys(n)) {
+      const v = n[k];
+      const p = path ? `${path}.${k}` : k;
+      if (re.test(k) && (typeof v === "number" || typeof v === "string" || Array.isArray(v))) {
+        let sample = v;
+        if (Array.isArray(v)) sample = JSON.stringify(v).slice(0, 120);
+        hits.push({ path: p, value: sample });
+      }
+      if (v && typeof v === "object") walk(v, p);
+    }
+  };
+  walk(root, "");
+  return hits;
+}
+
 /** Walk the JSON for the node most likely to carry the live score. */
 function findScoreNode(root) {
   const seen = new Set();
@@ -482,14 +510,27 @@ export class PolymarketUSClient {
    * exact field on the live app (call dumpMatchData and read it back).
    */
   async dumpMatchData(slug) {
-    const out = { slug, market: null, event: null, errors: [] };
+    const out = { slug, market: null, event: null, scoreHunt: [], errors: [] };
     try { out.market = await this.api.markets.retrieveBySlug(slug); }
     catch (e) { out.errors.push(`market: ${e.message}`); }
-    const eventSlug = out.market?.market?.eventSlug || out.market?.event?.slug;
+    const m = out.market?.market || out.market || {};
+    // The event object is where in-play game state usually lives. Resolve its
+    // slug from any field the payload might use, then fetch it - falling back to
+    // the raw client if the typed helper can't.
+    const eventSlug = m.eventSlug || m.event_slug || m.event?.slug || out.market?.event?.slug ||
+      (typeof m.eventId === "number" ? null : null);
     if (eventSlug) {
       try { out.event = await this.api.events.retrieveBySlug(eventSlug); }
-      catch (e) { out.errors.push(`event: ${e.message}`); }
+      catch (e1) {
+        try { out.event = await this.api.get?.(`/v1/events/slug/${eventSlug}`); }
+        catch (e2) { out.errors.push(`event slug "${eventSlug}": ${e1.message}`); }
+      }
+    } else {
+      out.errors.push(`no eventSlug on market. market keys: [${Object.keys(m).join(", ")}]`);
     }
+    // Surface every field that could be a live score, wherever it hides, so we
+    // can point the reader at the exact path (or confirm it's simply not here).
+    out.scoreHunt = huntScoreFields({ market: out.market, event: out.event });
     return out;
   }
 
