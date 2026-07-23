@@ -470,26 +470,33 @@ export class PolymarketUSClient {
       }
     } catch { /* list unavailable - fall back to whatever search gave us */ }
 
-    // 3) Enrich (bounded) and keep only STARTED, not-closed matches.
+    // 3) Enrich (bounded). Liveness is decided by whether we can READ A SCORE -
+    // gameStartTime proved unreliable (a live match showed a future start time),
+    // and a readable live score is by definition an in-play match. Everything we
+    // can't read is stashed with its raw fields for diagnosis.
     const list = [...candidates.values()];
     const live = [];
-    await Promise.all(list.slice(0, 30).map(async (c) => {
+    const unreadable = [];
+    await Promise.all(list.slice(0, 20).map(async (c) => {
       try {
         const dump = await this.dumpMatchData(c.tokenId);
         const m = dump.market?.market || dump.market || {};
         if (m.closed === true) return;
-        const startMs = _firstStartMs(m) ?? _firstStartMs(c._mk || {});
-        if (startMs === null || startMs > now + 60000) return; // not started yet
-        live.push({
-          tokenId: c.tokenId,
-          title: m.title || c.title,
-          outcome: m.outcome || c.outcome,
-          startMs,
-          score: extractLiveScore(dump, m.outcome || c.outcome),
-          scoreHunt: dump.scoreHunt || [],
-        });
+        const score = extractLiveScore(dump, m.outcome || c.outcome);
+        if (score) {
+          live.push({
+            tokenId: c.tokenId, title: m.title || c.title, outcome: m.outcome || c.outcome,
+            startMs: _firstStartMs(m), score, scoreHunt: dump.scoreHunt || [],
+          });
+        } else {
+          unreadable.push({
+            tokenId: c.tokenId, title: m.title || c.title, gameId: dump.gameId,
+            gameFetched: !!dump.game, scoreHunt: dump.scoreHunt || [], errors: dump.errors || [],
+          });
+        }
       } catch { /* skip */ }
     }));
+    this._lastUnreadable = unreadable; // for the engine's diagnostic
     live.sort((a, b) => (b.startMs || 0) - (a.startMs || 0));
     return live;
   }
@@ -603,27 +610,43 @@ export class PolymarketUSClient {
    * exact field on the live app (call dumpMatchData and read it back).
    */
   async dumpMatchData(slug) {
-    const out = { slug, market: null, event: null, scoreHunt: [], errors: [] };
+    const out = { slug, market: null, event: null, game: null, gameId: null, scoreHunt: [], errors: [] };
     try { out.market = await this.api.markets.retrieveBySlug(slug); }
     catch (e) { out.errors.push(`market: ${e.message}`); }
     const m = out.market?.market || out.market || {};
-    // The event object is where in-play game state usually lives. Resolve its
-    // slug from any field the payload might use, then fetch it - falling back to
-    // the raw client if the typed helper can't.
-    const eventSlug = m.eventSlug || m.event_slug || m.event?.slug || out.market?.event?.slug ||
-      (typeof m.eventId === "number" ? null : null);
+
+    // (a) Event by slug - where in-play state sometimes lives.
+    const eventSlug = m.eventSlug || m.event_slug || m.event?.slug || out.market?.event?.slug;
     if (eventSlug) {
       try { out.event = await this.api.events.retrieveBySlug(eventSlug); }
-      catch (e1) {
-        try { out.event = await this.api.get?.(`/v1/events/slug/${eventSlug}`); }
-        catch (e2) { out.errors.push(`event slug "${eventSlug}": ${e1.message}`); }
-      }
-    } else {
-      out.errors.push(`no eventSlug on market. market keys: [${Object.keys(m).join(", ")}]`);
+      catch (e1) { try { out.event = await this.api.get?.(`/v1/events/slug/${eventSlug}`); } catch { out.errors.push(`event slug "${eventSlug}": ${e1.message}`); } }
     }
-    // Surface every field that could be a live score, wherever it hides, so we
-    // can point the reader at the exact path (or confirm it's simply not here).
-    out.scoreHunt = huntScoreFields({ market: out.market, event: out.event });
+
+    // (b) THE GAME by its id. These Setka markets carry no event but they DO
+    // reference a game (the SDK's list filters take gameId), and the live score
+    // lives on that game object. Try every way to fetch it.
+    const gameId = m.gameId ?? m.game_id ?? m.gameID ?? m.game?.id ?? out.market?.gameId;
+    out.gameId = gameId ?? null;
+    if (gameId !== undefined && gameId !== null) {
+      const tries = [
+        () => this.api.get?.(`/v1/games/${gameId}`),
+        () => this.api.get?.(`/v1/game/id/${gameId}`),
+        () => this.api.get?.(`/v1/sports/games/${gameId}`),
+        () => this.api.get?.(`/v1/games/id/${gameId}`),
+        () => this.api.events.list?.({ gameId }),
+        () => this.api.get?.(`/v1/events`, { query: { gameId } }),
+      ];
+      for (const t of tries) {
+        try { const r = await t(); if (r && typeof r === "object" && Object.keys(r).length) { out.game = r; break; } }
+        catch { /* try the next shape */ }
+      }
+      if (!out.game) out.errors.push(`gameId ${gameId}: no game endpoint responded`);
+    } else {
+      out.errors.push(`no gameId/eventSlug on market. keys: [${Object.keys(m).join(", ")}]`);
+    }
+
+    // Surface every score-looking field across market + event + game.
+    out.scoreHunt = huntScoreFields({ market: out.market, event: out.event, game: out.game });
     return out;
   }
 

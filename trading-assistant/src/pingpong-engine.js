@@ -129,16 +129,19 @@ export class PingPongEngine {
         this._diagnoseNoScore(c);
       }
     }
-    if (liveSeen === 0) {
-      if (candidates.length === 0) {
-        this._logThrottledGlobal("nomatch", `Autopilot: search for [${cfg.query}] returned NO markets at all. If matches are live, the search terms don't match how the exchange names them - tell me the exact match name you see and I'll target it.`, "warn");
+    if (started === 0 && candidates.length === 0) {
+      // No readable-score matches. Report what the in-play matches actually
+      // contain (from the client's probe of market + event + game endpoints) so
+      // the score can be pinpointed - or it's confirmed the exchange lacks it.
+      const un = this.pm._lastUnreadable || [];
+      if (un.length) {
+        const sample = un.slice(0, 3).map((u) => {
+          const hunt = (u.scoreHunt || []).slice(0, 8).map((h) => `${h.path}=${h.value}`).join(", ") || "no score fields";
+          return `"${u.title}" [gameId=${u.gameId ?? "none"}, game-endpoint ${u.gameFetched ? "answered" : "no-response"}; fields: ${hunt}]`;
+        }).join(" || ");
+        this._logThrottledGlobal("noscore", `Autopilot: probed the live matches for a score. ${sample}`, "warn");
       } else {
-        // Show what we DID find (names + start times) so we can see why nothing is "live".
-        const sample = candidates.slice(0, 6).map((c) => {
-          const when = c.startMs ? new Date(c.startMs).toISOString().slice(5, 16).replace("T", " ") : "no-start-time";
-          return `"${c.marketTitle}" (${c.closed ? "closed" : when})`;
-        }).join("; ");
-        this._logThrottledGlobal("nolive", `Autopilot: found ${candidates.length} matches but none are STARTED yet. Sample: ${sample}. (Now is ${new Date().toISOString().slice(5, 16).replace("T", " ")} UTC.)`, "warn");
+        this._logThrottledGlobal("nomatch", `Autopilot: found no table-tennis matches in the active list for [${cfg.query}] this pass.`, "warn");
       }
     }
     return started;
@@ -161,8 +164,9 @@ export class PingPongEngine {
    * {tokenId, playerA, playerB, marketTitle, startMs, closed, score, scoreHunt}.
    */
   async _discoverMatches(query) {
-    // Primary: enumerate matches that are actually IN PLAY (search only returns
-    // upcoming ones, so the live match is invisible to it).
+    // Primary: enumerate matches that are actually IN PLAY. listLiveMatches
+    // decides liveness by whether a live SCORE is readable, so everything it
+    // returns is ready to trade right now.
     if (this.pm.listLiveMatches) {
       let live = [];
       try { live = await this.pm.listLiveMatches(query); } catch { live = []; }
@@ -174,7 +178,7 @@ export class PingPongEngine {
             playerA: c.outcome || a || "Player A",
             playerB: otherName(c.outcome || a, a, b) || "Player B",
             marketTitle: c.title,
-            startMs: c.startMs,          // already-started (listLiveMatches filters to live)
+            startMs: c.startMs ?? Date.now(),  // readable score => live now
             closed: false,
             score: c.score,
             scoreHunt: c.scoreHunt || [],
