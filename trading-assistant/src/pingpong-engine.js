@@ -161,9 +161,29 @@ export class PingPongEngine {
    * {tokenId, playerA, playerB, marketTitle, startMs, closed, score, scoreHunt}.
    */
   async _discoverMatches(query) {
+    // Primary: enumerate matches that are actually IN PLAY (search only returns
+    // upcoming ones, so the live match is invisible to it).
+    if (this.pm.listLiveMatches) {
+      let live = [];
+      try { live = await this.pm.listLiveMatches(query); } catch { live = []; }
+      if (live.length) {
+        return live.map((c) => {
+          const { a, b } = parseVersus(c.title);
+          return {
+            tokenId: c.tokenId,
+            playerA: c.outcome || a || "Player A",
+            playerB: otherName(c.outcome || a, a, b) || "Player B",
+            marketTitle: c.title,
+            startMs: c.startMs,          // already-started (listLiveMatches filters to live)
+            closed: false,
+            score: c.score,
+            scoreHunt: c.scoreHunt || [],
+          };
+        });
+      }
+    }
+    // Fallback: search + per-match start/score enrichment.
     if (!this.pm.searchMarkets) return [];
-    // Try SEVERAL queries and merge - one phrase like "Setka Cup table tennis"
-    // can match nothing while "table tennis" or "Setka" finds every match.
     const queries = (Array.isArray(query) ? query : String(query || "").split(","))
       .map((q) => q.trim()).filter(Boolean);
     if (!queries.length) queries.push("Setka Cup", "table tennis");
@@ -187,8 +207,7 @@ export class PingPongEngine {
         }
       }
     }
-    // Enrich (bounded) with the live details the search doesn't carry.
-    await Promise.all(cands.slice(0, 30).map(async (c) => {
+    await Promise.all(cands.slice(0, 25).map(async (c) => {
       try {
         const dump = await this.pm.dumpMatchData(c.tokenId);
         const m = dump.market?.market || dump.market || {};

@@ -56,6 +56,28 @@ function levelQty(l) { return l.qty ?? l.quantity ?? l.size ?? l.q; }
 // ---------- live table-tennis score extraction ----------
 const num = (v) => (v === null || v === undefined || v === "" || Number.isNaN(Number(v)) ? null : Number(v));
 
+const _START_FIELDS = ["gameStartTime", "gameTime", "startTime", "startDate", "eventStartTime", "gameStart", "startsAt", "scheduledTime", "start"];
+/** Parse the first present start-time field on a market object to epoch ms, or null. */
+function _firstStartMs(m) {
+  for (const f of _START_FIELDS) {
+    if (m && m[f]) { const t = Date.parse(m[f]); if (!Number.isNaN(t)) return t; }
+  }
+  return null;
+}
+/** Lowercase surname-ish tokens from an "A vs B" title, to scope the market list to this pool. */
+function _surnameTokens(title) {
+  const t = String(title || "").replace(/\s*[\(\[].*$/, "");
+  const m = t.match(/^(.*?)\s+(?:vs?\.?|versus|-|–|—)\s+(.*?)$/i);
+  const names = m ? [m[1], m[2]] : [];
+  const toks = [];
+  for (const nm of names) {
+    for (const w of String(nm).toLowerCase().split(/\s+/)) {
+      if (w.length >= 4) toks.push(w); // skip initials/short words
+    }
+  }
+  return toks;
+}
+
 /**
  * Pull a table-tennis live score out of an arbitrary sports-data JSON blob.
  * Returns { gamesA, gamesB, ptsA, ptsB } (A = the market's YES outcome) or null.
@@ -399,6 +421,77 @@ export class PolymarketUSClient {
     }));
     await this._attachQuotes(results);
     return results;
+  }
+
+  /**
+   * Find matches that are ACTUALLY IN PLAY right now. Polymarket search only
+   * returns UPCOMING markets, so an in-play match is invisible to it. This
+   * enumerates the full active-markets list (which does include started
+   * matches), scopes to the table-tennis / Setka universe, and keeps the ones
+   * whose start time has passed and that aren't closed. Returns
+   * [{tokenId, title, outcome, startMs, score, scoreHunt}] newest-start first.
+   */
+  async listLiveMatches(query = "Setka Cup, table tennis, Setka") {
+    const now = Date.now();
+    const queries = String(query).split(",").map((s) => s.trim()).filter(Boolean);
+    const universe = new Set();   // surname tokens of the match pool (from search)
+    const candidates = new Map(); // tokenId -> {tokenId, title, outcome, _mk?}
+
+    // 1) Seed the player/name universe (and any tradable tokens) from search.
+    for (const q of queries) {
+      let res = [];
+      try { res = await this.searchMarkets(q, 25); } catch { /* next query */ }
+      for (const ev of res || []) {
+        for (const o of ev.outcomes || []) {
+          const title = o.marketTitle || ev.eventTitle || "";
+          if (o.tokenId) candidates.set(o.tokenId, { tokenId: o.tokenId, title, outcome: o.outcome });
+          for (const n of _surnameTokens(title)) universe.add(n);
+        }
+      }
+    }
+
+    // 2) Enumerate the full active list - THIS is where in-play matches live.
+    try {
+      for (let page = 0; page < 4; page++) {
+        let r;
+        try { r = await this.api.markets.list({ active: true, closed: false, limit: 100, offset: page * 100 }); }
+        catch { break; }
+        const batch = r?.markets || r?.data?.markets || (Array.isArray(r) ? r : []);
+        for (const mk of batch) {
+          const slug = mk.slug || mk.marketSlug;
+          if (!slug || candidates.has(slug)) continue;
+          const title = mk.title || mk.question || "";
+          const blob = `${title} ${JSON.stringify(mk.category ?? mk.series ?? mk.tags ?? mk.league ?? "")}`.toLowerCase();
+          const isTT = blob.includes("setka") || blob.includes("table tennis") || blob.includes("table-tennis");
+          const inUniverse = title && [...universe].some((n) => title.toLowerCase().includes(n));
+          if (isTT || inUniverse) candidates.set(slug, { tokenId: slug, title, outcome: mk.outcome, _mk: mk });
+        }
+        if (batch.length < 100) break;
+      }
+    } catch { /* list unavailable - fall back to whatever search gave us */ }
+
+    // 3) Enrich (bounded) and keep only STARTED, not-closed matches.
+    const list = [...candidates.values()];
+    const live = [];
+    await Promise.all(list.slice(0, 30).map(async (c) => {
+      try {
+        const dump = await this.dumpMatchData(c.tokenId);
+        const m = dump.market?.market || dump.market || {};
+        if (m.closed === true) return;
+        const startMs = _firstStartMs(m) ?? _firstStartMs(c._mk || {});
+        if (startMs === null || startMs > now + 60000) return; // not started yet
+        live.push({
+          tokenId: c.tokenId,
+          title: m.title || c.title,
+          outcome: m.outcome || c.outcome,
+          startMs,
+          score: extractLiveScore(dump, m.outcome || c.outcome),
+          scoreHunt: dump.scoreHunt || [],
+        });
+      } catch { /* skip */ }
+    }));
+    live.sort((a, b) => (b.startMs || 0) - (a.startMs || 0));
+    return live;
   }
 
   /** Order an event's outcomes by how well their title matches the search terms. */
