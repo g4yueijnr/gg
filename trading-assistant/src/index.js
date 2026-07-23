@@ -7,6 +7,7 @@ import { Polymarket } from "./polymarket.js";
 import { PolymarketUSClient } from "./polymarket-us.js";
 import { RulesEngine } from "./rules.js";
 import { PingPongEngine } from "./pingpong-engine.js";
+import { ExternalScoreFeed } from "./scorefeed.js";
 import { Agent } from "./agent.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -43,7 +44,9 @@ async function main() {
 
   const rules = new RulesEngine({ polymarket: pm, store, notify });
   rules.start();
-  const pingpong = new PingPongEngine({ polymarket: pm, store, notify });
+  const scoreFeed = new ExternalScoreFeed({});
+  console.log(`[app] ping-pong score feed: ${scoreFeed.enabled() ? "BetsAPI (BETSAPI_TOKEN set)" : "none (set BETSAPI_TOKEN for live scores)"}`);
+  const pingpong = new PingPongEngine({ polymarket: pm, store, notify, scoreFeed });
   pingpong.start();
   const agent = new Agent({ polymarket: pm, rules, store, pingpong });
 

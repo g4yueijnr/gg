@@ -27,10 +27,11 @@ function parseStart(m) {
  *   - filled + open stake never exceeds maxExposureUsd.
  */
 export class PingPongEngine {
-  constructor({ polymarket, store, notify }) {
+  constructor({ polymarket, store, notify, scoreFeed }) {
     this.pm = polymarket;
     this.store = store;
     this.notify = notify || (() => {});
+    this.scoreFeed = scoreFeed || null; // external live-score feed (BetsAPI); optional
     this._locks = new Map();       // id -> promise chain (serialize per strategy)
     this._ttlTimers = new Map();   // id -> setTimeout handle for the resting quote
     this._orderIds = new Set();     // every order id we've placed (safe stray sweep)
@@ -72,8 +73,13 @@ export class PingPongEngine {
     this.store.state.settings ||= {};
     this.store.state.settings.ppAutopilot = { on: true, perTradeUsd, maxExposurePerMatch, maxConcurrent, query, edgeEarly, edgeLate };
     this.store.save();
+    const src = this.scoreFeed?.enabled() ? "BetsAPI live feed" : "Polymarket (no external feed configured)";
     this.store.addActivity("pingpong",
-      `AUTOPILOT ON - hunting live "${query}" matches every 60s. Trades each live match it can read: $${perTradeUsd}/quote, $${maxExposurePerMatch}/match, up to ${maxConcurrent} at once.`, { level: "success" });
+      `AUTOPILOT ON - score source: ${src}. Trades each live match: $${perTradeUsd}/quote, $${maxExposurePerMatch}/match, up to ${maxConcurrent} at once.`, { level: "success" });
+    if (!this.scoreFeed?.enabled()) {
+      this.store.addActivity("pingpong",
+        `Heads up: no BETSAPI_TOKEN set, so scores come only from Polymarket - which usually doesn't publish the live table-tennis score. For reliable live scores, add a BETSAPI_TOKEN (free at betsapi.com) in your hosting env vars.`, { level: "warn" });
+    }
     this._armAutopilot();
     const found = await this._autopilotTick(); // do a first pass right away
     return { on: true, perTradeUsd, maxExposurePerMatch, maxConcurrent, query, startedNow: found };
@@ -103,6 +109,8 @@ export class PingPongEngine {
   async _autopilotTick() {
     const cfg = this.store.state.settings?.ppAutopilot;
     if (!cfg?.on) return 0;
+    // Preferred: the external feed KNOWS which matches are live and their score.
+    if (this.scoreFeed?.enabled()) return this._autopilotTickFromFeed(cfg);
     let candidates = [];
     try { candidates = await this._discoverMatches(cfg.query); } catch { return 0; }
     const now = Date.now();
@@ -145,6 +153,70 @@ export class PingPongEngine {
       }
     }
     return started;
+  }
+
+  /**
+   * Feed-driven discovery: the external feed lists live matches with scores.
+   * For each, find its Polymarket market by the players' names and run a
+   * strategy on it, seeding the score immediately.
+   */
+  async _autopilotTickFromFeed(cfg) {
+    let matches = [];
+    try { matches = await this.scoreFeed.liveMatches(); } catch { return 0; }
+    if (!matches.length) {
+      this._logThrottledGlobal("feed-empty", "Autopilot: the live-score feed shows no in-play table-tennis matches right now.", "info");
+      return 0;
+    }
+    let started = 0, unmatched = 0;
+    for (const m of matches) {
+      if (this.activeStrategies().length >= cfg.maxConcurrent) break;
+      let market;
+      try { market = await this._findMarketForPlayers(m.home, m.away); } catch { market = null; }
+      if (!market) { unmatched++; continue; }
+      if (this.activeStrategies().find((s) => s.tokenId === market.tokenId)) continue;
+      // Orient the score so A = the market's YES outcome.
+      const score = this._orientScore(m, market.outcome);
+      try {
+        const s = await this.createStrategy({
+          tokenId: market.tokenId, playerA: market.outcome || m.home, playerB: score.playerB, marketQuestion: market.title,
+          perTradeUsd: cfg.perTradeUsd, maxExposureUsd: cfg.maxExposurePerMatch,
+          edgeEarly: cfg.edgeEarly, edgeLate: cfg.edgeLate,
+        });
+        s.feedNames = { home: m.home, away: m.away };
+        this.store.save();
+        await this.updateScore(s.id, { gamesA: score.gamesA, gamesB: score.gamesB, ptsA: score.ptsA, ptsB: score.ptsB });
+        started++;
+      } catch { /* already running / not tradable */ }
+    }
+    if (started === 0 && unmatched > 0) {
+      this._logThrottledGlobal("feed-nomarket", `Autopilot: the feed shows ${matches.length} live match(es) but none matched a Polymarket market by name yet (e.g. "${matches[0].home} vs ${matches[0].away}"). Will keep trying.`, "warn");
+    }
+    return started;
+  }
+
+  /** Find the Polymarket market for two named players via search. */
+  async _findMarketForPlayers(home, away) {
+    if (!this.pm.searchMarkets) return null;
+    const q = `${_firstSurname(home)} ${_firstSurname(away)}`.trim();
+    let res = [];
+    try { res = await this.pm.searchMarkets(q, 10); } catch { return null; }
+    for (const ev of res || []) {
+      for (const o of ev.outcomes || []) {
+        const title = (o.marketTitle || ev.eventTitle || "").toLowerCase();
+        if (title.includes(_firstSurname(home).toLowerCase()) && title.includes(_firstSurname(away).toLowerCase())) {
+          return { tokenId: o.tokenId, outcome: o.outcome, title: o.marketTitle || ev.eventTitle };
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Orient a feed score (A=home) to the market's YES outcome. */
+  _orientScore(m, outcomeName) {
+    const oc = String(outcomeName || "").toLowerCase();
+    const homeIsYes = !oc || _firstSurname(m.home).toLowerCase().split(" ").some((w) => w && oc.includes(w)) || !_firstSurname(m.away).toLowerCase().split(" ").some((w) => w && oc.includes(w));
+    if (homeIsYes) return { gamesA: m.gamesA, gamesB: m.gamesB, ptsA: m.ptsA, ptsB: m.ptsB, playerB: m.away };
+    return { gamesA: m.gamesB, gamesB: m.gamesA, ptsA: m.ptsB, ptsB: m.ptsA, playerB: m.home };
   }
 
   /** Log the raw score-looking fields for a live match we can't price, so we can pinpoint the score. */
@@ -239,13 +311,25 @@ export class PingPongEngine {
    * - no human types anything. If the exchange can't supply a score for this
    * market, the poller stays quiet (and a manual/HTTP updateScore still works).
    */
+  /** Read a strategy's current score: the external feed first (by player names), then Polymarket. */
+  async _readScore(s) {
+    if (this.scoreFeed?.enabled()) {
+      const names = s.feedNames || {};
+      try {
+        const sc = await this.scoreFeed.scoreFor(names.home || s.playerA, names.away || s.playerB);
+        if (sc) return sc;
+      } catch { /* fall through to Polymarket */ }
+    }
+    if (this.pm.getLiveScore) { try { return await this.pm.getLiveScore(s.tokenId); } catch { return null; } }
+    return null;
+  }
+
   _startPoller(s) {
     this._stopPoller(s.id);
-    if (!this.pm.getLiveScore) return;
+    if (!this.scoreFeed?.enabled() && !this.pm.getLiveScore) return;
     const ms = Math.max(1000, (s.pollSec || 3) * 1000);
     const tick = async () => {
-      let sc;
-      try { sc = await this.pm.getLiveScore(s.tokenId); } catch { return; }
+      const sc = await this._readScore(s);
       if (!sc) { this._noteNoScore(s); return; }
       const key = `${sc.gamesA}-${sc.gamesB}:${sc.ptsA}-${sc.ptsB}`;
       if (this._lastScoreKey.get(s.id) === key) return; // unchanged - nothing to do
@@ -538,6 +622,13 @@ export class PingPongEngine {
       this._log(s, text, level);
     }
   }
+}
+
+/** The most distinctive (longest) name token - used to match feed names to market titles. */
+function _firstSurname(name) {
+  const words = String(name || "").replace(/[^\p{L}\s]/gu, " ").split(/\s+/).filter((w) => w.length >= 3);
+  if (!words.length) return String(name || "").trim();
+  return words.slice().sort((a, b) => b.length - a.length)[0];
 }
 
 /** Split "A vs B" / "A v B" / "A - B" (any casing/separator) into the two names. */

@@ -21,6 +21,13 @@ export const config = {
   polymarketUsKeyId: process.env.POLYMARKET_US_KEY_ID || "",
   polymarketUsSecret: process.env.POLYMARKET_US_SECRET_KEY || "",
 
+  // --- External live-score feed (ping-pong strategy) ---
+  // Polymarket does NOT expose the live table-tennis score, so the ping-pong
+  // strategy reads it from BetsAPI, which covers Setka Cup (league 22307).
+  // Get a token at https://betsapi.com (free tier available) and set BETSAPI_TOKEN.
+  betsapiToken: process.env.BETSAPI_TOKEN || "",
+  betsapiHost: process.env.BETSAPI_HOST || "https://api.b365api.com",
+
   // --- Polymarket global (polymarket.com) credentials ---
   // Your wallet private key (exported from Polymarket: profile -> settings -> export private key)
   polymarketPrivateKey: process.env.POLYMARKET_PRIVATE_KEY || "",
