@@ -45,7 +45,7 @@ async function main() {
   const rules = new RulesEngine({ polymarket: pm, store, notify });
   rules.start();
   const scoreFeed = new ExternalScoreFeed({});
-  console.log(`[app] ping-pong score feed: ${scoreFeed.enabled() ? "BetsAPI (BETSAPI_TOKEN set)" : "none (set BETSAPI_TOKEN for live scores)"}`);
+  console.log(`[app] ping-pong live-score feed: ${scoreFeed.enabled() ? scoreFeed.sourceName() : "disabled"}`);
   const pingpong = new PingPongEngine({ polymarket: pm, store, notify, scoreFeed });
   pingpong.start();
   const agent = new Agent({ polymarket: pm, rules, store, pingpong });

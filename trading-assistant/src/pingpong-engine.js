@@ -73,13 +73,9 @@ export class PingPongEngine {
     this.store.state.settings ||= {};
     this.store.state.settings.ppAutopilot = { on: true, perTradeUsd, maxExposurePerMatch, maxConcurrent, query, edgeEarly, edgeLate };
     this.store.save();
-    const src = this.scoreFeed?.enabled() ? "BetsAPI live feed" : "Polymarket (no external feed configured)";
+    const src = this.scoreFeed?.enabled() ? this.scoreFeed.sourceName() : "Polymarket only (no feed)";
     this.store.addActivity("pingpong",
-      `AUTOPILOT ON - score source: ${src}. Trades each live match: $${perTradeUsd}/quote, $${maxExposurePerMatch}/match, up to ${maxConcurrent} at once.`, { level: "success" });
-    if (!this.scoreFeed?.enabled()) {
-      this.store.addActivity("pingpong",
-        `Heads up: no BETSAPI_TOKEN set, so scores come only from Polymarket - which usually doesn't publish the live table-tennis score. For reliable live scores, add a BETSAPI_TOKEN (free at betsapi.com) in your hosting env vars.`, { level: "warn" });
-    }
+      `AUTOPILOT ON - live scores from ${src} (free, no key needed). Trades each live match: $${perTradeUsd}/quote, $${maxExposurePerMatch}/match, up to ${maxConcurrent} at once.`, { level: "success" });
     this._armAutopilot();
     const found = await this._autopilotTick(); // do a first pass right away
     return { on: true, perTradeUsd, maxExposurePerMatch, maxConcurrent, query, startedNow: found };
