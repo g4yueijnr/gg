@@ -13,10 +13,11 @@ export class Store {
     this.state = {
       rules: [],        // standing instructions (auto-outbid etc.)
       strategies: [],   // model-priced strategies (e.g. ping-pong live quoting)
+      timedCancels: [], // scheduled auto-cancels for specific open orders
       messages: [],     // chat history (Anthropic message format)
       activity: [],     // human-readable activity log
       settings: {},     // runtime overrides (e.g. dryRun toggled from chat)
-      counters: { rule: 0, strategy: 0 },
+      counters: { rule: 0, strategy: 0, timedCancel: 0 },
     };
     this._load();
     this._writeTimer = null;
@@ -69,6 +70,13 @@ export class Store {
     this.state.counters.strategy += 1;
     this.save();
     return `pp-${this.state.counters.strategy}`;
+  }
+
+  nextTimedCancelId() {
+    if (!this.state.counters.timedCancel) this.state.counters.timedCancel = 0;
+    this.state.counters.timedCancel += 1;
+    this.save();
+    return `tc-${this.state.counters.timedCancel}`;
   }
 
   addActivity(kind, text, meta = {}) {

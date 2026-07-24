@@ -18,6 +18,7 @@ export class RulesEngine {
     this._lastAction = new Map(); // ruleId -> ts of last repost (throttle)
     this._reconcileTimer = null;
     this._expiryTimers = new Map(); // ruleId -> timer for precise timed cancels
+    this._orderCancelTimers = new Map(); // timedCancelId -> timer that pulls specific orders at a time
     // Every order id the engine has ever placed. Lets us safely cancel a rule's
     // own strays (a re-bid whose old order didn't die) WITHOUT ever touching an
     // order the user placed by hand. This is the guard against self-bidding wars.
@@ -80,6 +81,13 @@ export class RulesEngine {
     // stray-order sweeps and re-attach recognize orders we placed before.
     for (const r of this.store.state.rules) this._trackOrder(r.orderId);
 
+    // Re-arm scheduled order cancels; fire any whose time passed while we were down.
+    for (const job of this.store.state.timedCancels || []) {
+      if (job.status !== "scheduled") continue;
+      if (Date.parse(job.expiresAt) <= Date.now()) this._fireOrderCancel(job).catch(() => {});
+      else this._armOrderCancel(job);
+    }
+
     this.pm.onBookUpdate((summary) => this._onBook(summary));
     // Real-time fills/cancels/rejects from the exchange's private stream -
     // the primary fill path; reconcile below is the safety net.
@@ -133,7 +141,9 @@ export class RulesEngine {
   stop() {
     clearInterval(this._reconcileTimer);
     for (const t of this._expiryTimers.values()) clearTimeout(t);
+    for (const t of this._orderCancelTimers.values()) clearTimeout(t);
     this._expiryTimers.clear();
+    this._orderCancelTimers.clear();
   }
 
   /** Emergency stop: cancel every rule and every open order on the account. */
@@ -159,6 +169,82 @@ export class RulesEngine {
       `EMERGENCY STOP: ${stopped.length} rule(s) stopped, ${(cancelled.canceledOrderIds || []).length} open order(s) cancelled.`, { level: "warn" });
     this.notify(entry);
     return { rulesStopped: stopped, ordersCancelled: cancelled.canceledOrderIds || [] };
+  }
+
+  // ---------- timed cancels for EXISTING orders (non-destructive expiry) ----------
+
+  /**
+   * Schedule specific already-resting orders to auto-cancel at a time - WITHOUT
+   * cancelling or recreating them now. This is how you put an "expiry" on bare
+   * orders (you were never meant to have to cancel-and-recreate them as rules).
+   * orderIds: the order ids to pull; expiresAt: ISO 8601 UTC datetime.
+   */
+  scheduleOrderCancel({ orderIds, expiresAt }) {
+    const ids = (Array.isArray(orderIds) ? orderIds : [orderIds]).map(String).filter(Boolean);
+    if (!ids.length) throw new Error("No order ids given to schedule a cancel for.");
+    const ts = Date.parse(expiresAt);
+    if (Number.isNaN(ts)) throw new Error(`Couldn't parse expiresAt "${expiresAt}" - use ISO like 2026-07-24T12:00:00Z.`);
+    if (ts <= Date.now()) throw new Error(`expiresAt (${expiresAt}) is in the past.`);
+    const job = {
+      id: this.store.nextTimedCancelId(),
+      orderIds: ids,
+      expiresAt: new Date(ts).toISOString(),
+      status: "scheduled",
+      createdAt: new Date().toISOString(),
+    };
+    (this.store.state.timedCancels ||= []).push(job);
+    this.store.save();
+    this._armOrderCancel(job);
+    const entry = this.store.addActivity("system",
+      `Scheduled auto-cancel of ${ids.length} order(s) at ${new Date(ts).toUTCString()} (${job.id}). The orders stay live and untouched until then.`, { level: "info" });
+    this.notify(entry);
+    return job;
+  }
+
+  listTimedCancels() { return this.store.state.timedCancels || []; }
+
+  /** Cancel a scheduled timed-cancel job (the orders keep resting). */
+  cancelTimedCancel(id) {
+    const job = (this.store.state.timedCancels || []).find((j) => j.id === id);
+    if (!job) throw new Error(`No scheduled cancel ${id}.`);
+    if (job.status === "scheduled") {
+      job.status = "cancelled";
+      job.updatedAt = new Date().toISOString();
+      clearTimeout(this._orderCancelTimers.get(id));
+      this._orderCancelTimers.delete(id);
+      this.store.save();
+    }
+    return job;
+  }
+
+  _armOrderCancel(job) {
+    clearTimeout(this._orderCancelTimers.get(job.id));
+    this._orderCancelTimers.delete(job.id);
+    if (job.status !== "scheduled") return;
+    const ms = Date.parse(job.expiresAt) - Date.now();
+    if (ms > 2 ** 31 - 1000) return; // too far out for a timer; reconcile-on-restart re-arms
+    const t = setTimeout(() => { this._fireOrderCancel(job).catch(() => {}); }, Math.max(ms, 0));
+    if (t.unref) t.unref();
+    this._orderCancelTimers.set(job.id, t);
+  }
+
+  async _fireOrderCancel(job) {
+    if (job.status !== "scheduled") return;
+    if (Date.now() < Date.parse(job.expiresAt) - 1500) { this._armOrderCancel(job); return; }
+    const cancelled = [];
+    const failed = [];
+    for (const orderId of job.orderIds) {
+      try { await this.pm.cancelOrder(orderId); cancelled.push(orderId); }
+      catch (err) { failed.push(orderId); console.warn(`[rules] timed-cancel ${orderId} failed: ${err.message}`); }
+    }
+    job.status = "done";
+    job.cancelledOrderIds = cancelled;
+    job.updatedAt = new Date().toISOString();
+    this._orderCancelTimers.delete(job.id);
+    this.store.save();
+    const entry = this.store.addActivity("system",
+      `Timed auto-cancel fired (${job.id}): pulled ${cancelled.length} order(s)${failed.length ? `, ${failed.length} already gone/failed` : ""}.`, { level: "warn" });
+    this.notify(entry);
   }
 
   /**

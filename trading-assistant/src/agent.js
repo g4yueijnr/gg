@@ -30,6 +30,9 @@ How to behave:
 - If the user reports "two orders" / "duplicate orders" / "outbidding itself": call list_rules and list_open_orders, then if there are multiple active rules on the same market/side, cancel_rule the extras (keep one) - the engine now prevents this, but clean up any pre-existing mess. A single rule keeps exactly one order resting; you never need to place a second.
 - Cancelling a rule ALWAYS pulls its resting order off the book (in any status, including error) - so "cancel it" fully stops it. One rule owns exactly one resting order at a time; you never need to hunt for a separate leftover order after cancelling a rule.
 - Rules SELF-HEAL: the 24/7 engine auto-recovers a rule whose order was rejected, cancelled outside the app, or lost to a hiccup - it re-places the bid on its own and keeps the rule active. You should almost never see "error" status now. If a rule is briefly holding (e.g. the market ran past its cap, or a bid can't rest without crossing), that's the engine waiting to re-enter, not a failure - tell the user it will re-bid automatically when the market comes back into range, and offer to raise the cap/budget if they want it to compete now. Only cancel+recreate if the market/outcome/side itself is wrong.
+- EXPIRY ON EXISTING ORDERS: when the user wants their current/open orders to auto-cancel at a time ("cancel my orders at 8am", "pull these at game start"), use schedule_order_cancel with those orderIds (from list_open_orders) and an ISO UTC time. NEVER cancel_order and re-place an order to "add an expiry" - that destroys their orders and their queue position. schedule_order_cancel leaves the orders live and untouched until the time. Only auto-outbid RULES take an expiry at creation (expiresAt); bare orders use schedule_order_cancel.
+- Before doing anything DESTRUCTIVE the user didn't literally ask for (cancelling existing orders, replacing them), stop and confirm. "Add an expiry", "set a timer", "make them cancel later" is NOT a request to cancel now - it's schedule_order_cancel. If unsure whether they want orders pulled now vs later, ask one short question.
+- START PRICE vs the live market: an auto-outbid rule always tries to be the top bid up to the cap. If the user's start price is BELOW the current best bid on their side, the engine will immediately jump to one tick above the market (up to the cap) - it will NOT rest at the low start price. Before creating such a rule, tell the user their start (e.g. 53c) is below the live best bid (e.g. 70c), so it'll place at ~70c right away, and ask if they want that or to rest passively lower. Never let them be surprised that it "jumped to the cap".
 - "Stop everything" / "cancel all" -> emergency_stop. Confirm what was cancelled from the tool result.
 - After creating a rule, confirm it as a compact structured summary: market/outcome, starting bid, outbid rule, cap, size, budget, exit-on-fill, auto-cancel time, and status (say SIMULATED instead of LIVE when dry-run is on).
 - Cancel conditions ("cancel it Friday night", "pull it after 24 hours"): compute an ISO UTC datetime from the current time in <context> and pass it as expiresAt. Confirm the exact time back to the user in their terms.
@@ -185,6 +188,32 @@ function toolDefs() {
         type: "object",
         properties: { query: { type: "string", description: "The market to test: text, polymarket link, or slug" } },
         required: ["query"],
+      },
+    },
+    {
+      name: "schedule_order_cancel",
+      description: "Put an EXPIRY on existing already-resting orders WITHOUT cancelling or recreating them. The orders stay live and untouched until expiresAt, then the engine auto-cancels exactly those orders. Use this whenever the user wants their current/open orders to auto-cancel at a time (e.g. 'cancel my orders at 8am', 'pull these when the game starts'). NEVER cancel_order + re-place to add an expiry - that destroys the user's orders. Get the order ids from list_open_orders.",
+      input_schema: {
+        type: "object",
+        properties: {
+          orderIds: { type: "array", items: { type: "string" }, description: "The orderId values (from list_open_orders) to auto-cancel." },
+          expiresAt: { type: "string", description: "ISO 8601 UTC datetime, e.g. 2026-07-24T12:00:00Z. Convert the user's local time (compute from <context> now)." },
+        },
+        required: ["orderIds", "expiresAt"],
+      },
+    },
+    {
+      name: "list_timed_cancels",
+      description: "List scheduled timed order-cancels (which orders auto-cancel and when).",
+      input_schema: { type: "object", properties: {} },
+    },
+    {
+      name: "cancel_timed_cancel",
+      description: "Un-schedule a timed order-cancel by its id (tc-...). The orders keep resting; only the scheduled auto-cancel is removed.",
+      input_schema: {
+        type: "object",
+        properties: { id: { type: "string" } },
+        required: ["id"],
       },
     },
     {
@@ -355,6 +384,9 @@ export class Agent {
           { level: "warn" });
         return { mode: input.live ? "LIVE" : "DRY_RUN", note: entry.text };
       }
+      case "schedule_order_cancel": return this.rules.scheduleOrderCancel(input);
+      case "list_timed_cancels": return this.rules.listTimedCancels();
+      case "cancel_timed_cancel": return this.rules.cancelTimedCancel(input.id);
       case "get_activity": {
         const limit = input.limit || 20;
         return this.store.state.activity.slice(-limit);
