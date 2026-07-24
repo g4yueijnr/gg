@@ -271,6 +271,7 @@ export class Agent {
     this.client = config.anthropicApiKey ? new Anthropic({ apiKey: config.anthropicApiKey }) : null;
     this.busy = false;
     this._migrateHistory();
+    this._repairHistory();
   }
 
   /** Older versions stored chat history in OpenAI's message format; reset if found. */
@@ -282,6 +283,50 @@ export class Agent {
     if (looksForeign) {
       console.log("[agent] resetting chat history from previous provider format");
       this.store.state.messages = [];
+      this.store.save();
+    }
+  }
+
+  /**
+   * Guarantee the Anthropic invariant: every `tool_use` block is immediately
+   * followed by a message containing a `tool_result` for it. A turn interrupted
+   * mid-tool (a redeploy/crash right after the assistant's tool calls were saved
+   * but before their results) leaves a dangling `tool_use`, and then EVERY
+   * future request 400s ("tool_use ids were found without tool_result blocks").
+   * This backfills synthetic error results so the conversation stays usable.
+   */
+  _repairHistory() {
+    const msgs = this.store.state.messages || [];
+    const out = [];
+    let repaired = 0;
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i];
+      out.push(m);
+      if (m.role !== "assistant" || !Array.isArray(m.content)) continue;
+      const toolUses = m.content.filter((b) => b && b.type === "tool_use");
+      if (!toolUses.length) continue;
+      const next = msgs[i + 1];
+      const nextIsResults = next && next.role === "user" && Array.isArray(next.content) &&
+        next.content.some((b) => b.type === "tool_result");
+      const have = new Set();
+      if (nextIsResults) for (const b of next.content) if (b.type === "tool_result") have.add(b.tool_use_id);
+      const missing = toolUses.filter((tu) => !have.has(tu.id));
+      if (!missing.length) continue;
+      const fills = missing.map((tu) => ({
+        type: "tool_result", tool_use_id: tu.id,
+        content: "(this action was interrupted before it finished; state may have changed - re-check if needed)",
+        is_error: true,
+      }));
+      repaired += missing.length;
+      if (nextIsResults) {
+        next.content = [...fills, ...next.content]; // complete the existing results message
+      } else {
+        out.push({ role: "user", content: fills }); // insert a results message right after
+      }
+    }
+    if (repaired > 0) {
+      console.log(`[agent] repaired chat history: backfilled ${repaired} missing tool_result(s)`);
+      this.store.state.messages = out;
       this.store.save();
     }
   }
@@ -361,6 +406,9 @@ export class Agent {
     if (this.busy) throw new Error("Assistant is still working on the previous message.");
     this.busy = true;
     try {
+      // Heal any dangling tool_use from a previously interrupted turn before we
+      // build on the history - otherwise the request 400s on a corrupt sequence.
+      this._repairHistory();
       const messages = this.store.state.messages;
       // Ambient context rides along with the user turn (keeps the system prompt stable/cacheable).
       const contextNote =
