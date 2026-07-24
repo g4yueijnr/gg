@@ -1,0 +1,19 @@
+{
+  "name": "polymarket-trading-assistant",
+  "version": "1.0.0",
+  "description": "Personal Polymarket trading assistant - Claude-powered chat + always-on auto-outbid engine",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "license": "UNLICENSED",
+  "type": "module",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "@polymarket/clob-client": "^5.8.1",
+    "dotenv": "^17.4.2",
+    "ethers": "^5.8.0",
+    "express": "^5.2.1",
+    "polymarket-us": "^0.1.1",
+    "ws": "^8.21.0"
+  }
+}
